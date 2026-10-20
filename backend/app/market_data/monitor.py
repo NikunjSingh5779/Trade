@@ -5,6 +5,7 @@ from app.agent.tools import summarize_bars
 from app.config import Settings
 from app.market_data.alpaca import AlpacaMarketData
 from app.market_data.feeds import ConfiguredFeedService
+from app.market_data.freshness import MarketDataFreshnessError, ensure_fresh_bars
 from app.market_data.sessions import current_scan_window, is_regular_us_session
 from app.storage import Database
 
@@ -41,12 +42,26 @@ class MarketMonitor:
         summaries = []
         for symbol in symbols:
             recent = self.db.get_bars(symbol, limit=50)
-            if recent:
-                # Mark paper positions even when the AI queue is backed up.
-                self.db.mark_position(symbol, float(recent[-1]["close"]))
-                summaries.append(summarize_bars(recent))
+            if not recent:
+                continue
+            try:
+                ensure_fresh_bars(
+                    recent, "intraday", self.settings.max_stale_data_seconds
+                )
+            except MarketDataFreshnessError as exc:
+                self.db.add_audit("market_scan.symbol_skipped_stale", {
+                    "symbol": symbol, "reason": str(exc)[:200],
+                })
+                continue
+            # Mark paper positions only from data fresh enough for intraday decisions.
+            self.db.mark_position(symbol, float(recent[-1]["close"]))
+            summaries.append(summarize_bars(recent))
         if not summaries:
-            return {"status": "no_data", "symbols_requested": symbols}
+            return {
+                "status": "no_fresh_data",
+                "symbols_requested": symbols,
+                "bar_count": len(bars),
+            }
         if self.db.active_queue_count() >= self.settings.ai_queue_max_pending:
             self.db.add_audit("market_scan.skipped", {
                 "reason": "AI queue is full", "bars_received": len(bars),
