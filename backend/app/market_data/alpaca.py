@@ -37,7 +37,8 @@ class AlpacaMarketData:
             return []
         per_symbol_limit = max(1, min(int(limit), 10000))
         end = datetime.now(UTC)
-        start = end - timedelta(days=5)
+        lookback_days = 365 if timeframe == "1Day" else 5
+        start = end - timedelta(days=lookback_days)
         headers = {
             "APCA-API-KEY-ID": self.settings.market_data_api_key,
             "APCA-API-SECRET-KEY": self.settings.market_data_api_secret,

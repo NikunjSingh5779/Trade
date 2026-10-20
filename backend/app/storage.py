@@ -248,12 +248,15 @@ class Database:
                 count += 1
         return count
 
-    def get_bars(self, symbol: str, limit: int = 100) -> list[dict[str, Any]]:
+    def get_bars(
+        self, symbol: str, limit: int = 100, timeframe: str = "5Min"
+    ) -> list[dict[str, Any]]:
+        """Return only bars matching the requested timeframe, oldest first."""
         with self.connect() as conn:
             rows = conn.execute(
                 "SELECT symbol,timestamp,open,high,low,close,volume,source FROM bars "
-                "WHERE symbol=? ORDER BY timestamp DESC LIMIT ?",
-                (symbol.upper(), limit),
+                "WHERE symbol=? AND timeframe=? ORDER BY timestamp DESC LIMIT ?",
+                (symbol.upper(), timeframe, limit),
             ).fetchall()
             return [dict(row) for row in reversed(rows)]
 

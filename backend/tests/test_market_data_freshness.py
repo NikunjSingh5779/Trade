@@ -62,3 +62,31 @@ def test_future_market_timestamp_is_rejected():
     future = [{"timestamp": (now + timedelta(minutes=3)).isoformat()}]
     with pytest.raises(MarketDataFreshnessError, match="future"):
         ensure_fresh_bars(future, "intraday", 600, now=now)
+
+
+@pytest.mark.asyncio
+async def test_daily_bars_request_a_year_of_history():
+    captured = {}
+
+    def respond(request):
+        captured.update(dict(request.url.params))
+        return httpx.Response(200, json={
+            "bars": {"AAPL": []},
+            "next_page_token": None,
+        })
+
+    settings = Settings(
+        _env_file=None,
+        market_data_api_key="test-key",
+        market_data_api_secret="test-secret",
+        local_model_base_urls="http://127.0.0.1:8080/v1",
+    )
+    with respx.mock(base_url=settings.market_data_base_url) as mock:
+        mock.get("/v2/stocks/bars").mock(side_effect=respond)
+        await AlpacaMarketData(settings).fetch_bars(["AAPL"], timeframe="1Day", limit=100)
+
+    start = datetime.fromisoformat(captured["start"].replace("Z", "+00:00"))
+    end = datetime.fromisoformat(captured["end"].replace("Z", "+00:00"))
+    assert captured["timeframe"] == "1Day"
+    assert captured["limit"] == "100"
+    assert (end - start).days >= 364
