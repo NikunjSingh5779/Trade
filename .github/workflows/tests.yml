@@ -12,11 +12,14 @@ jobs:
         with:
           python-version: "3.12"
       - name: Install backend
-        run: python -m pip install -e "backend[test]"
+        working-directory: backend
+        run: python -m pip install -e ".[test]"
       - name: Run tests
-        run: python -m pytest backend/tests -q
+        working-directory: backend
+        run: python -m pytest tests -q
       - name: Lint backend
-        run: python -m ruff check backend/app backend/tests
+        working-directory: backend
+        run: python -m ruff check app tests
   frontend:
     runs-on: ubuntu-latest
     steps:
