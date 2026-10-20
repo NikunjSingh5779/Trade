@@ -39,6 +39,13 @@ class MarketMonitor:
         symbols = self.db.list_watchlist()
         bars = await self.provider.fetch_bars(symbols)
         self.db.save_bars(bars, source="alpaca")
+
+        # Process each fetched candle oldest-first so exits use OHLC crossings,
+        # not merely the final close. The database ignores all pre-entry candles.
+        for bar in bars:
+            for exit_event in self.db.process_position_bar(bar):
+                self.db.add_audit("paper_position.auto_exit", exit_event)
+
         summaries = []
         for symbol in symbols:
             recent = self.db.get_bars(symbol, limit=50)
@@ -53,8 +60,7 @@ class MarketMonitor:
                     "symbol": symbol, "reason": str(exc)[:200],
                 })
                 continue
-            # Mark paper positions only from data fresh enough for intraday decisions.
-            self.db.mark_position(symbol, float(recent[-1]["close"]))
+            # Position marks are updated candle-by-candle above, after checking stop/target.
             summaries.append(summarize_bars(recent))
         if not summaries:
             return {

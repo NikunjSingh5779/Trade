@@ -49,3 +49,97 @@ def test_market_bars_are_isolated_by_timeframe(tmp_path):
     assert len(db.get_bars("AAPL", timeframe="1Day")) == 1
     assert db.get_bars("AAPL", timeframe="5Min")[0]["timestamp"] == "2026-10-20T19:55:00Z"
     assert db.get_bars("AAPL", timeframe="1Day")[0]["timestamp"] == "2026-10-20T13:30:00Z"
+
+
+
+def _insert_open_position(db, *, side="long", opened_at="2026-10-20T19:00:00+00:00"):
+    with db.connect() as conn:
+        conn.execute(
+            "INSERT INTO positions(id,proposal_id,symbol,side,quantity,entry_price,current_price,"
+            "stop_loss,take_profit,status,opened_at) VALUES (?,?,?,?,?,?,?,?,?,'open',?)",
+            ("pos-test", "prop-test", "AAPL", side, 10, 100.0, 100.0,
+             95.0 if side == "long" else 105.0,
+             110.0 if side == "long" else 90.0, opened_at),
+        )
+
+
+def _bar(*, timestamp="2026-10-20T19:05:00Z", open_price=100, high=103, low=97, close=101):
+    return {
+        "symbol": "AAPL", "timestamp": timestamp,
+        "open": open_price, "high": high, "low": low, "close": close, "volume": 100,
+    }
+
+
+def test_paper_position_auto_closes_at_take_profit_and_records_realized_pnl(tmp_path):
+    db = Database(str(tmp_path / "test.db"))
+    db.initialize([])
+    _insert_open_position(db)
+
+    exits = db.process_position_bar(_bar(high=111, close=109))
+
+    assert len(exits) == 1
+    assert exits[0]["reason"] == "take_profit"
+    assert exits[0]["exit_price"] == 110.0
+    assert exits[0]["realized_pnl"] == 100.0
+    assert exits[0]["mode"] == "paper"
+    with db.connect() as conn:
+        position = conn.execute("SELECT * FROM positions WHERE id='pos-test'").fetchone()
+    assert position["status"] == "closed"
+    assert position["current_price"] == 110.0
+    assert position["realized_pnl"] == 100.0
+
+    # Replayed historical bars must not close or book the same position twice.
+    assert db.process_position_bar(_bar(high=111, close=109)) == []
+    assert len(db.list_orders()) == 0
+
+
+def test_paper_stop_wins_when_one_bar_crosses_both_levels(tmp_path):
+    db = Database(str(tmp_path / "test.db"))
+    db.initialize([])
+    _insert_open_position(db)
+
+    exits = db.process_position_bar(_bar(high=112, low=94, close=105))
+
+    assert len(exits) == 1
+    assert exits[0]["reason"] == "stop_loss_ambiguous_bar"
+    assert exits[0]["exit_price"] == 95.0
+    assert exits[0]["realized_pnl"] == -50.0
+
+
+def test_paper_exit_handles_gap_beyond_stop_conservatively(tmp_path):
+    db = Database(str(tmp_path / "test.db"))
+    db.initialize([])
+    _insert_open_position(db)
+
+    exits = db.process_position_bar(_bar(open_price=92, high=96, low=91, close=94))
+
+    assert len(exits) == 1
+    assert exits[0]["reason"] == "stop_loss_gap"
+    assert exits[0]["exit_price"] == 92.0
+    assert exits[0]["realized_pnl"] == -80.0
+
+
+def test_paper_short_position_closes_at_take_profit(tmp_path):
+    db = Database(str(tmp_path / "test.db"))
+    db.initialize([])
+    _insert_open_position(db, side="short")
+
+    exits = db.process_position_bar(_bar(high=102, low=89, close=92))
+
+    assert len(exits) == 1
+    assert exits[0]["reason"] == "take_profit"
+    assert exits[0]["exit_price"] == 90.0
+    assert exits[0]["realized_pnl"] == 100.0
+
+
+def test_position_bar_before_entry_is_ignored(tmp_path):
+    db = Database(str(tmp_path / "test.db"))
+    db.initialize([])
+    _insert_open_position(db, opened_at="2026-10-20T19:06:00+00:00")
+
+    exits = db.process_position_bar(_bar(high=112, low=94))
+
+    assert exits == []
+    with db.connect() as conn:
+        position = conn.execute("SELECT * FROM positions WHERE id='pos-test'").fetchone()
+    assert position["status"] == "open"

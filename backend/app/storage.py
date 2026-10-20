@@ -413,3 +413,107 @@ class Database:
                 "UPDATE positions SET current_price=? WHERE symbol=? AND status='open'",
                 (price, symbol.upper()),
             )
+
+    def process_position_bar(self, bar: dict[str, Any]) -> list[dict[str, Any]]:
+        """Update one paper position mark and simulate stop/target exits from one completed OHLC bar.
+
+        If a bar touches both stop and target without an opening gap resolving the order,
+        the stop is chosen first as a conservative assumption. This is paper simulation only.
+        """
+        symbol = str(bar.get("symbol", "")).strip().upper()
+        if not symbol:
+            raise ValueError("A symbol is required to process a market bar.")
+        try:
+            bar_time = datetime.fromisoformat(str(bar["timestamp"]).replace("Z", "+00:00"))
+            open_price = float(bar["open"])
+            high = float(bar["high"])
+            low = float(bar["low"])
+            close = float(bar["close"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("Market bar is missing valid OHLC values or timestamp.") from exc
+        if bar_time.tzinfo is None:
+            bar_time = bar_time.replace(tzinfo=UTC)
+        bar_time = bar_time.astimezone(UTC)
+        if not all(price > 0 for price in (open_price, high, low, close)):
+            raise ValueError("Market bar prices must be positive.")
+        if low > min(open_price, close) or high < max(open_price, close) or low > high:
+            raise ValueError("Market bar has inconsistent OHLC values.")
+
+        exits: list[dict[str, Any]] = []
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            rows = conn.execute(
+                "SELECT * FROM positions WHERE symbol=? AND status='open'",
+                (symbol,),
+            ).fetchall()
+            for row in rows:
+                try:
+                    opened_at = datetime.fromisoformat(row["opened_at"].replace("Z", "+00:00"))
+                except (AttributeError, ValueError):
+                    # Fail closed if this legacy position has no trustworthy entry time.
+                    continue
+                if opened_at.tzinfo is None:
+                    opened_at = opened_at.replace(tzinfo=UTC)
+                if bar_time <= opened_at.astimezone(UTC):
+                    # Never replay pre-entry candles against a newly opened position.
+                    continue
+
+                stop = float(row["stop_loss"])
+                target = float(row["take_profit"])
+                side = row["side"]
+                exit_price: float | None = None
+                reason: str | None = None
+
+                if side == "long":
+                    if open_price <= stop:
+                        exit_price, reason = open_price, "stop_loss_gap"
+                    elif open_price >= target:
+                        exit_price, reason = open_price, "take_profit_gap"
+                    elif low <= stop and high >= target:
+                        exit_price, reason = stop, "stop_loss_ambiguous_bar"
+                    elif low <= stop:
+                        exit_price, reason = stop, "stop_loss"
+                    elif high >= target:
+                        exit_price, reason = target, "take_profit"
+                elif side == "short":
+                    if open_price >= stop:
+                        exit_price, reason = open_price, "stop_loss_gap"
+                    elif open_price <= target:
+                        exit_price, reason = open_price, "take_profit_gap"
+                    elif high >= stop and low <= target:
+                        exit_price, reason = stop, "stop_loss_ambiguous_bar"
+                    elif high >= stop:
+                        exit_price, reason = stop, "stop_loss"
+                    elif low <= target:
+                        exit_price, reason = target, "take_profit"
+                else:
+                    continue
+
+                if exit_price is None:
+                    conn.execute(
+                        "UPDATE positions SET current_price=? WHERE id=? AND status='open'",
+                        (close, row["id"]),
+                    )
+                    continue
+
+                sign = 1 if side == "long" else -1
+                pnl = (exit_price - float(row["entry_price"])) * int(row["quantity"]) * sign
+                conn.execute(
+                    "UPDATE positions SET current_price=?,status='closed',closed_at=?,realized_pnl=? "
+                    "WHERE id=? AND status='open'",
+                    (exit_price, bar_time.isoformat(), pnl, row["id"]),
+                )
+                exits.append({
+                    "position_id": row["id"],
+                    "symbol": symbol,
+                    "side": side,
+                    "quantity": int(row["quantity"]),
+                    "entry_price": float(row["entry_price"]),
+                    "exit_price": exit_price,
+                    "reason": reason,
+                    "realized_pnl": pnl,
+                    "bar_timestamp": bar_time.isoformat(),
+                    "mode": "paper",
+                })
+            conn.commit()
+        return exits
