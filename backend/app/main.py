@@ -126,7 +126,7 @@ async def chat(request: ChatRequest) -> dict[str, Any]:
 
 @app.get("/api/jobs")
 async def list_jobs(limit: int = 50) -> dict[str, Any]:
-    return {"jobs": db.list_jobs(max(1, min(limit, 200))}
+    return {"jobs": db.list_jobs(max(1, min(limit, 200)))}
 
 
 @app.get("/api/jobs/{job_id}")
