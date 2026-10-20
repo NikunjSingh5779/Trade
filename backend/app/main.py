@@ -4,6 +4,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+import httpx
+
 import portalocker
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -164,18 +166,50 @@ async def run_market_scan() -> dict[str, Any]:
 
 
 @app.get("/api/market/bars/{symbol}")
-async def get_bars(symbol: str, limit: int = 100) -> dict[str, Any]:
-    return {"symbol": symbol.upper(), "bars": db.get_bars(symbol, max(1, min(limit, 500)))}
+async def get_bars(
+    symbol: str, limit: int = 100, timeframe: str = "5Min"
+) -> dict[str, Any]:
+    if timeframe not in {"5Min", "1Day"}:
+        raise HTTPException(status_code=422, detail="timeframe must be 5Min or 1Day.")
+    return {
+        "symbol": symbol.upper(),
+        "timeframe": timeframe,
+        "bars": db.get_bars(symbol, max(1, min(limit, 500)), timeframe=timeframe),
+    }
 
 
 @app.post("/api/proposals/analyze", status_code=202)
 async def analyze_proposal(request: AnalyzeRequest) -> dict[str, Any]:
     symbol = request.symbol.strip().upper()
-    bars = db.get_bars(symbol, limit=100)
+    data_timeframe = "1Day" if request.timeframe == "swing" else "5Min"
+
+    # Swing analysis must use actual daily candles, not 5-minute bars relabeled
+    # as a swing request. Refresh daily data directly when credentials are configured.
+    if request.timeframe == "swing" and market_provider.configured:
+        try:
+            daily_bars = await market_provider.fetch_bars(
+                [symbol], timeframe="1Day", limit=100
+            )
+            if daily_bars:
+                db.save_bars(daily_bars, source="alpaca", timeframe="1Day")
+        except (httpx.HTTPError, ValueError, TypeError, KeyError) as exc:
+            db.add_audit("proposal.daily_bars_fetch_failed", {
+                "symbol": symbol, "error_type": type(exc).__name__,
+            })
+            raise HTTPException(
+                status_code=502,
+                detail="Could not fetch daily market bars for swing analysis. Check Alpaca connectivity.",
+            ) from exc
+
+    bars = db.get_bars(symbol, limit=100, timeframe=data_timeframe)
     if len(bars) < 10:
+        expected = "daily" if request.timeframe == "swing" else "5-minute"
         raise HTTPException(
             status_code=422,
-            detail=f"At least 10 stored bars are required for {symbol}. Run a market scan first.",
+            detail=(
+                f"At least 10 {expected} bars are required for {symbol}. "
+                "Refresh market data and try again."
+            ),
         )
     try:
         ensure_fresh_bars(bars, request.timeframe, settings.max_stale_data_seconds)
