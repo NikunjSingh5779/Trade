@@ -4,14 +4,19 @@ from typing import Any
 from app.agent.controller import AgentController
 from app.agent.schemas import TradeProposal
 from app.inference.gate import InferenceGateBusy
+from app.market_data.freshness import ensure_fresh_bars
 from app.storage import Database, utc_now
 
 
 class QueueWorker:
-    def __init__(self, db: Database, agent: AgentController, max_pending: int = 100):
+    def __init__(
+        self, db: Database, agent: AgentController, max_pending: int = 100,
+        max_stale_data_seconds: int = 600,
+    ):
         self.db = db
         self.agent = agent
         self.max_pending = max_pending
+        self.max_stale_data_seconds = max_stale_data_seconds
         self._stop = asyncio.Event()
 
     async def run_forever(self) -> None:
@@ -46,6 +51,11 @@ class QueueWorker:
 
     async def _process(self, task: str, payload: dict[str, Any]) -> dict[str, Any]:
         if task == "analyze_proposal":
+            ensure_fresh_bars(
+                payload.get("bars", []),
+                str(payload.get("timeframe", "intraday")),
+                self.max_stale_data_seconds,
+            )
             result = await self.agent.run(task, payload)
             structured = result.get("structured")
             if isinstance(structured, dict) and not structured.get("no_setup"):

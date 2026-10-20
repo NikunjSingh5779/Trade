@@ -21,6 +21,7 @@ from app.inference.gate import InferenceGate
 from app.inference.router import InferenceRouter, NoModelAvailable
 from app.market_data.alpaca import AlpacaMarketData, MarketDataUnavailable
 from app.market_data.feeds import ConfiguredFeedService
+from app.market_data.freshness import MarketDataFreshnessError, ensure_fresh_bars
 from app.market_data.monitor import MarketMonitor
 from app.queue.worker import QueueWorker
 from app.storage import Database
@@ -31,7 +32,9 @@ settings.ensure_local_paths()
 db = Database(settings.database_path)
 router = InferenceRouter(settings, InferenceGate(settings.inference_lock_path))
 agent = AgentController(router)
-worker = QueueWorker(db, agent, settings.ai_queue_max_pending)
+worker = QueueWorker(
+    db, agent, settings.ai_queue_max_pending, settings.max_stale_data_seconds
+)
 market_provider = AlpacaMarketData(settings)
 feed_service = ConfiguredFeedService(settings)
 monitor = MarketMonitor(settings, db, market_provider, feed_service)
@@ -174,6 +177,10 @@ async def analyze_proposal(request: AnalyzeRequest) -> dict[str, Any]:
             status_code=422,
             detail=f"At least 10 stored bars are required for {symbol}. Run a market scan first.",
         )
+    try:
+        ensure_fresh_bars(bars, request.timeframe, settings.max_stale_data_seconds)
+    except MarketDataFreshnessError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     summary = summarize_bars(bars)
     if "error" in summary:
         raise HTTPException(status_code=422, detail=summary["error"])
@@ -236,7 +243,7 @@ async def update_stops(position_id: str, request: UpdateStopsRequest) -> dict[st
         if row["side"] == "long":
             valid = request.stop_loss < row["current_price"] < request.take_profit
         else:
-            valid = request.take_profit < row["current_price"] < request.stop_loss
+            valid = request.take_profit < row["current_price"] < row["stop_loss"]
         if not valid:
             conn.rollback()
             raise HTTPException(
