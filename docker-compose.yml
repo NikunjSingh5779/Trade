@@ -1,0 +1,17 @@
+# Optional local development only. For Windows-native operation, use scripts/dev.ps1.
+# No database, model, or broker service is launched automatically.
+services:
+  backend:
+    build:
+      context: ./backend
+    environment:
+      DATABASE_PATH: /app/data/trading_agent.db
+      HOST: 0.0.0.0
+      PAPER_TRADING_ONLY: "true"
+      LIVE_TRADING_ENABLED: "false"
+      ALLOW_LIVE_ORDER_ENDPOINTS: "false"
+    ports:
+      - "127.0.0.1:8000:8000"
+    volumes:
+      - ./data:/app/data
+    restart: unless-stopped
