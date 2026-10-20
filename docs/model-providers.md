@@ -17,3 +17,8 @@ Third-party plans and quotas can change. The software cannot guarantee ongoing f
 ## Prompt and output policy
 
 Model outputs are untrusted. Trade proposals must be machine-parseable and validated against a strict schema. The model cannot place trades, change hard risk controls, or self-promote strategies. Never send API keys, account passwords, private credentials, or unnecessary personal information in prompt payloads.
+
+
+## News and economic events
+
+Optional RSS/Atom feeds can be configured via `NEWS_RSS_URLS` and `ECONOMIC_EVENTS_RSS_URLS` in the local `.env` file. URLs must use HTTPS. Feeds are fetched sequentially, deduplicated, and passed as sourced items in market-scan/proposal context. No feed URL is accepted from model output. Empty configuration means news/events are unavailable; the app does not claim comprehensive event-calendar coverage.

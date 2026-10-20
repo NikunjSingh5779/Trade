@@ -16,6 +16,11 @@ class WatchlistRequest(BaseModel):
     symbols: list[str] = Field(min_length=1, max_length=100)
 
 
+class ResearchRequest(BaseModel):
+    question: str = Field(default="Research a robust, testable strategy improvement.", min_length=5, max_length=4000)
+    symbols: list[str] = Field(default_factory=list, max_length=30)
+
+
 class TradeProposal(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -56,6 +61,11 @@ class RejectRequest(BaseModel):
 
 class ClosePositionRequest(BaseModel):
     simulated_exit_price: float = Field(gt=0, allow_inf_nan=False)
+
+
+class UpdateStopsRequest(BaseModel):
+    stop_loss: float = Field(gt=0, allow_inf_nan=False)
+    take_profit: float = Field(gt=0, allow_inf_nan=False)
 
 
 class JobResponse(BaseModel):

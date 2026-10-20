@@ -6,6 +6,7 @@ import {
   Wallet, X
 } from "lucide-react";
 import { FormEvent, useCallback, useEffect, useState } from "react";
+import PositionActions from "@/components/PositionActions";
 import { api, Job, Portfolio, Proposal } from "@/lib/api";
 
 type Health = {
@@ -207,9 +208,9 @@ export default function AgentDashboard() {
           <Panel className="p-5">
             <SectionTitle icon={Wallet} title="Open paper positions" note="Simulated only"/>
             <div className="mt-4 overflow-x-auto">
-              <table className="w-full min-w-[570px] text-left text-xs">
-                <thead className="text-[#71819a]"><tr className="border-b border-[#263449]"><th className="pb-3 font-medium">Symbol</th><th className="pb-3 font-medium">Side / Qty</th><th className="pb-3 font-medium">Entry</th><th className="pb-3 font-medium">Mark</th><th className="pb-3 font-medium">Stop / Target</th></tr></thead>
-                <tbody>{(portfolio?.open_positions ?? []).map(pos => <tr key={pos.id} className="border-b border-[#1f2b3d] last:border-0"><td className="py-3 font-semibold">{pos.symbol}</td><td className="py-3 capitalize">{pos.side} / {pos.quantity}</td><td className="py-3">{money(pos.entry_price)}</td><td className="py-3">{money(pos.current_price)}</td><td className="py-3">{money(pos.stop_loss)} / {money(pos.take_profit)}</td></tr>)}
+              <table className="w-full min-w-[800px] text-left text-xs">
+                <thead className="text-[#71819a]"><tr className="border-b border-[#263449]"><th className="pb-3 font-medium">Symbol</th><th className="pb-3 font-medium">Side / Qty</th><th className="pb-3 font-medium">Entry</th><th className="pb-3 font-medium">Mark</th><th className="pb-3 font-medium">Stop / Target</th><th className="pb-3 font-medium">Manage</th></tr></thead>
+                <tbody>{(portfolio?.open_positions ?? []).map(pos => <tr key={pos.id} className="border-b border-[#1f2b3d] last:border-0"><td className="py-3 font-semibold">{pos.symbol}</td><td className="py-3 capitalize">{pos.side} / {pos.quantity}</td><td className="py-3">{money(pos.entry_price)}</td><td className="py-3">{money(pos.current_price)}</td><td className="py-3">{money(pos.stop_loss)} / {money(pos.take_profit)}</td><td className="py-3"><PositionActions position={pos} onChanged={() => void refresh()}/></td></tr>)}
                   {(portfolio?.open_positions ?? []).length === 0 && <tr><td colSpan={5} className="py-6 text-center text-[#71819a]">No open paper positions yet.</td></tr>}
                 </tbody>
               </table>

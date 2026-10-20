@@ -50,6 +50,9 @@ class Settings(BaseSettings):
     market_scan_interval_seconds: int = Field(default=300, ge=60, le=3600)
     max_stale_data_seconds: int = Field(default=600, ge=60, le=86400)
     watchlist_symbols: str = "SPY,QQQ,AAPL,MSFT"
+    news_rss_urls: str = ""
+    economic_events_rss_urls: str = ""
+    news_feed_timeout_seconds: float = Field(default=8.0, ge=1, le=30)
 
     paper_initial_equity: float = Field(default=100000, gt=0)
     risk_per_trade_pct: float = Field(default=0.25, gt=0, le=1)

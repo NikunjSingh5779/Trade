@@ -1,5 +1,6 @@
 import asyncio
 from contextlib import asynccontextmanager
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -11,7 +12,7 @@ from fastapi.responses import JSONResponse
 from app.agent.controller import AgentController
 from app.agent.schemas import (
     AnalyzeRequest, ApprovalRequest, ChatRequest, ClosePositionRequest,
-    RejectRequest, WatchlistRequest,
+    RejectRequest, ResearchRequest, UpdateStopsRequest, WatchlistRequest,
 )
 from app.agent.tools import summarize_bars
 from app.config import get_settings
@@ -19,6 +20,7 @@ from app.execution.paper_broker import PaperBroker
 from app.inference.gate import InferenceGate
 from app.inference.router import InferenceRouter, NoModelAvailable
 from app.market_data.alpaca import AlpacaMarketData, MarketDataUnavailable
+from app.market_data.feeds import ConfiguredFeedService
 from app.market_data.monitor import MarketMonitor
 from app.queue.worker import QueueWorker
 from app.storage import Database
@@ -31,7 +33,8 @@ router = InferenceRouter(settings, InferenceGate(settings.inference_lock_path))
 agent = AgentController(router)
 worker = QueueWorker(db, agent, settings.ai_queue_max_pending)
 market_provider = AlpacaMarketData(settings)
-monitor = MarketMonitor(settings, db, market_provider)
+feed_service = ConfiguredFeedService(settings)
+monitor = MarketMonitor(settings, db, market_provider, feed_service)
 paper_broker = PaperBroker(settings, db)
 
 
@@ -100,6 +103,16 @@ async def market_status() -> dict[str, Any]:
     return monitor.status()
 
 
+@app.get("/api/news")
+async def news(symbol: str | None = None, limit: int = 20) -> dict[str, Any]:
+    return await feed_service.fetch_news(symbol=symbol, limit=max(1, min(limit, 100)))
+
+
+@app.get("/api/events")
+async def economic_events(limit: int = 20) -> dict[str, Any]:
+    return await feed_service.fetch_events(limit=max(1, min(limit, 100)))
+
+
 @app.post("/api/chat", status_code=202)
 async def chat(request: ChatRequest) -> dict[str, Any]:
     if db.active_queue_count() >= settings.ai_queue_max_pending:
@@ -166,7 +179,10 @@ async def analyze_proposal(request: AnalyzeRequest) -> dict[str, Any]:
         raise HTTPException(status_code=422, detail=summary["error"])
     job = db.create_job("analyze_proposal", {
         "symbol": symbol, "timeframe": request.timeframe, "bars": bars,
-        "deterministic_summary": summary, "instruction": "Do not invent evidence or place orders.",
+        "deterministic_summary": summary,
+        "news": await feed_service.fetch_news(symbol=symbol, limit=10),
+        "economic_events": await feed_service.fetch_events(limit=10),
+        "instruction": "Do not invent evidence or place orders.",
     })
     return {"job_id": job["id"], "status": job["status"], "symbol": symbol}
 
@@ -206,6 +222,40 @@ async def orders(limit: int = 100) -> dict[str, Any]:
     return {"orders": db.list_orders(max(1, min(limit, 200)))}
 
 
+@app.post("/api/positions/{position_id}/stops")
+async def update_stops(position_id: str, request: UpdateStopsRequest) -> dict[str, Any]:
+    with db.connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute("SELECT * FROM positions WHERE id=?", (position_id,)).fetchone()
+        if row is None:
+            conn.rollback()
+            raise HTTPException(status_code=404, detail="Position not found.")
+        if row["status"] != "open":
+            conn.rollback()
+            raise HTTPException(status_code=409, detail="Position is already closed.")
+        if row["side"] == "long":
+            valid = request.stop_loss < row["current_price"] < request.take_profit
+        else:
+            valid = request.take_profit < row["current_price"] < request.stop_loss
+        if not valid:
+            conn.rollback()
+            raise HTTPException(
+                status_code=422,
+                detail="Stops must bracket the current mark in the correct direction for the position side.",
+            )
+        conn.execute(
+            "UPDATE positions SET stop_loss=?,take_profit=? WHERE id=?",
+            (request.stop_loss, request.take_profit, position_id),
+        )
+        conn.commit()
+    db.add_audit("paper_position.stops_updated", {
+        "position_id": position_id, "stop_loss": request.stop_loss,
+        "take_profit": request.take_profit, "updated_at": datetime.now(UTC).isoformat(),
+    })
+    return {"position_id": position_id, "status": "updated", "mode": "paper",
+            "stop_loss": request.stop_loss, "take_profit": request.take_profit}
+
+
 @app.post("/api/positions/{position_id}/close")
 async def close_position(position_id: str, request: ClosePositionRequest) -> dict[str, Any]:
     try:
@@ -216,6 +266,31 @@ async def close_position(position_id: str, request: ClosePositionRequest) -> dic
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.post("/api/research/propose", status_code=202)
+async def propose_research(request: ResearchRequest) -> dict[str, Any]:
+    requested = [item.strip().upper() for item in request.symbols if item.strip()]
+    symbols = list(dict.fromkeys(requested or db.list_watchlist()))[:30]
+    summaries = []
+    for symbol in symbols:
+        bars = db.get_bars(symbol, limit=100)
+        if bars:
+            summaries.append(summarize_bars(bars))
+    payload = {
+        "question": request.question,
+        "market": "US equities",
+        "market_summaries": summaries,
+        "paper_portfolio": db.portfolio_snapshot(settings.paper_initial_equity),
+        "prior_experiments": db.list_experiments(),
+        "news": await feed_service.fetch_news(limit=20),
+        "economic_events": await feed_service.fetch_events(limit=20),
+        "instruction": "Propose a research experiment only. Do not place trades or activate strategies.",
+    }
+    if db.active_queue_count() >= settings.ai_queue_max_pending:
+        raise HTTPException(status_code=429, detail="AI task queue is full; try again later.")
+    job = db.create_job("research", payload)
+    return {"job_id": job["id"], "status": job["status"]}
 
 
 @app.get("/api/research/experiments")
