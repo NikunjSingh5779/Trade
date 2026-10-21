@@ -8,7 +8,7 @@ from app.config import Settings
 from app.market_data.alpaca import AlpacaMarketData
 from app.market_data.feeds import ConfiguredFeedService
 from app.market_data.freshness import MarketDataFreshnessError, ensure_fresh_bars
-from app.market_data.sessions import current_scan_window, is_regular_us_session
+from app.market_data.sessions import current_scan_window, is_regular_us_bar, is_regular_us_session
 from app.storage import Database
 
 
@@ -141,11 +141,7 @@ class MarketMonitor:
                         continue
                     if stamp.tzinfo is None:
                         stamp = stamp.replace(tzinfo=UTC)
-                    local_stamp = stamp.astimezone(_US_EASTERN)
-                    if (
-                        local_stamp.weekday() >= 5
-                        or not time(9, 30) <= local_stamp.time().replace(tzinfo=None) < time(16, 0)
-                    ):
+                    if not is_regular_us_bar(bar):
                         continue
                     for event in self.db.process_position_bar(bar, timeframe="intraday"):
                         self.db.add_audit("paper_position.auto_exit", event)
@@ -214,6 +210,8 @@ class MarketMonitor:
                     for bar in exit_bars:
                         if not is_completed_market_bar(bar, position_horizon):
                             continue
+                        if position_horizon == "intraday" and not is_regular_us_bar(bar):
+                            continue
                         for exit_event in self.db.process_position_bar(
                             bar, timeframe=position_horizon
                         ):
@@ -233,7 +231,7 @@ class MarketMonitor:
             recent = self.db.get_bars(symbol, limit=100)
             completed = [
                 bar for bar in recent
-                if is_completed_market_bar(bar, "intraday")
+                if is_completed_market_bar(bar, "intraday") and is_regular_us_bar(bar)
             ]
             if len(completed) < 10:
                 self.db.add_audit("market_scan.symbol_skipped_insufficient_completed_bars", {
