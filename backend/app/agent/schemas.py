@@ -60,7 +60,9 @@ class RejectRequest(BaseModel):
 
 
 class ClosePositionRequest(BaseModel):
-    simulated_exit_price: float = Field(gt=0, allow_inf_nan=False)
+    # Accepted for backwards compatibility with the current UI, but the backend deliberately
+    # ignores it and closes at the last server-recorded mark.
+    simulated_exit_price: float | None = Field(default=None, gt=0, allow_inf_nan=False)
 
 
 class UpdateStopsRequest(BaseModel):

@@ -108,3 +108,52 @@ def test_unknown_timeframe_fails_closed_instead_of_getting_the_swing_limit():
 
     with pytest.raises(MarketDataFreshnessError, match="Unsupported timeframe"):
         ensure_fresh_bars(bars, "weekly", 600, now=now)
+
+
+
+@pytest.mark.asyncio
+async def test_exit_backfill_follows_page_tokens_until_all_bars_are_returned():
+    captured = []
+
+    def respond(request):
+        params = dict(request.url.params)
+        captured.append(params)
+        if params.get("page_token") == "page-2":
+            rows = [
+                {"t": "2026-10-20T19:10:00Z", "o": 10, "h": 11, "l": 9, "c": 10.5, "v": 20},
+                {"t": "2026-10-20T19:15:00Z", "o": 10, "h": 11, "l": 9, "c": 10.6, "v": 21},
+            ]
+            token = None
+        else:
+            rows = [
+                {"t": "2026-10-20T19:00:00Z", "o": 10, "h": 11, "l": 9, "c": 10.1, "v": 18},
+                {"t": "2026-10-20T19:05:00Z", "o": 10, "h": 11, "l": 9, "c": 10.2, "v": 19},
+            ]
+            token = "page-2"
+        return httpx.Response(200, json={
+            "bars": {"AAPL": rows},
+            "next_page_token": token,
+        })
+
+    settings = Settings(
+        _env_file=None,
+        market_data_api_key="test-key",
+        market_data_api_secret="test-secret",
+        local_model_base_urls="http://127.0.0.1:8080/v1",
+    )
+    start = datetime(2026, 10, 20, 18, 59, tzinfo=UTC)
+    with respx.mock(base_url=settings.market_data_base_url) as mock:
+        mock.get("/v2/stocks/bars").mock(side_effect=respond)
+        bars = await AlpacaMarketData(settings).fetch_bars(
+            ["AAPL"], timeframe="5Min", limit=2, start_time=start
+        )
+
+    assert len(captured) == 2
+    assert captured[0]["sort"] == "asc"
+    assert captured[1]["page_token"] == "page-2"
+    assert [bar["timestamp"] for bar in bars] == [
+        "2026-10-20T19:00:00Z",
+        "2026-10-20T19:05:00Z",
+        "2026-10-20T19:10:00Z",
+        "2026-10-20T19:15:00Z",
+    ]

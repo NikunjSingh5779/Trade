@@ -15,14 +15,14 @@ A client timeout can leave ambiguity about whether a remote server continues gen
 ## Data path
 
 1. The market monitor checks weekday US regular market hours every configured interval (default 300 seconds).
-2. The market adapter requests bars for the active watchlist and persists normalized observations.
-3. Open paper positions are marked from the latest locally stored close when available.
+2. The market adapter requests recent bars for the active watchlist and persists normalized observations.
+3. Open positions have a durable last-processed-bar checkpoint. The monitor backfills from each open position's entry/checkpoint timestamp using provider pagination, processes completed OHLC candles chronologically, and records paper exits. Intraday positions use five-minute candles; swing positions use completed daily candles.
 4. The monitor coalesces market-scan jobs by scan window and skips AI enqueuing if the queue is full, without skipping data collection.
 5. The queue worker claims one persistent job at a time and invokes the same agent controller.
 6. Proposal analysis only persists an idea if the model produces valid JSON matching the strict proposal schema, the requested symbol and timeframe, and an entry price near the latest close. The server stamps the data timeframe on the proposal, and approval freshness uses that stamp rather than the model's own label.
 7. Risk validation sizes shares using equity, stop distance, risk budget, daily loss, gross exposure, and max-open-position rules.
 8. A human approval is bound to proposal ID and version.
-9. The SQLite transaction inserts a simulated order and position exactly once, and marks the proposal approved.
+9. The SQLite transaction inserts a simulated order and position exactly once, and marks the proposal approved. Paper fills use the latest server-stored bar close with adverse simulated entry slippage; the proposed entry itself is not assumed to have traded.
 
 ## Failure behavior
 
@@ -36,4 +36,4 @@ Malformed model outputs do not create proposals. Missing models fail AI jobs wit
 - No public hosting or multi-user authentication
 - No guarantees about provider free quotas or simulated fill fidelity
 - Initial session check excludes weekends and outside-hours but is not an exchange holiday calendar
-- Paper fills are simplified and do not simulate partial fills, slippage, or fees
+- Paper fills remain simplified; partial fills, full entry/exit slippage modeling, fees, borrow costs, and broker-side protective orders are not implemented

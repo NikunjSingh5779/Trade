@@ -3,9 +3,10 @@ from __future__ import annotations
 import json
 import sqlite3
 import uuid
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 
 def utc_now() -> str:
@@ -23,12 +24,18 @@ class Database:
         self.path = path
         Path(path).parent.mkdir(parents=True, exist_ok=True)
 
-    def connect(self) -> sqlite3.Connection:
+    @contextmanager
+    def connect(self) -> Iterator[sqlite3.Connection]:
+        """Open a short-lived connection and always close it, including on exceptions."""
         connection = sqlite3.connect(self.path, timeout=10, isolation_level=None)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys=ON")
         connection.execute("PRAGMA busy_timeout=10000")
-        return connection
+        try:
+            with connection:
+                yield connection
+        finally:
+            connection.close()
 
     def initialize(self, symbols: list[str]) -> None:
         with self.connect() as conn:
@@ -57,7 +64,9 @@ class Database:
                     entry_price REAL NOT NULL, current_price REAL NOT NULL,
                     stop_loss REAL NOT NULL, take_profit REAL NOT NULL,
                     status TEXT NOT NULL, opened_at TEXT NOT NULL, closed_at TEXT,
-                    realized_pnl REAL NOT NULL DEFAULT 0
+                    realized_pnl REAL NOT NULL DEFAULT 0,
+                    timeframe TEXT NOT NULL DEFAULT 'intraday',
+                    last_processed_bar_at TEXT
                 );
                 CREATE INDEX IF NOT EXISTS ix_positions_status ON positions(status);
                 CREATE TABLE IF NOT EXISTS watchlist (
@@ -81,6 +90,33 @@ class Database:
                     updated_at TEXT NOT NULL
                 );
             """)
+            # Migrate databases created before position-specific timeframes existed.
+            position_columns = {
+                row["name"] for row in conn.execute("PRAGMA table_info(positions)").fetchall()
+            }
+            if "timeframe" not in position_columns:
+                conn.execute(
+                    "ALTER TABLE positions ADD COLUMN timeframe TEXT NOT NULL DEFAULT 'intraday'"
+                )
+            if "last_processed_bar_at" not in position_columns:
+                conn.execute(
+                    "ALTER TABLE positions ADD COLUMN last_processed_bar_at TEXT"
+                )
+            legacy_positions = conn.execute(
+                "SELECT p.id, pr.body_json FROM positions p "
+                "JOIN proposals pr ON pr.id=p.proposal_id"
+            ).fetchall()
+            for legacy in legacy_positions:
+                try:
+                    recorded_timeframe = json.loads(legacy["body_json"]).get("timeframe")
+                except (TypeError, json.JSONDecodeError):
+                    recorded_timeframe = None
+                if recorded_timeframe in {"intraday", "swing"}:
+                    conn.execute(
+                        "UPDATE positions SET timeframe=? WHERE id=?",
+                        (recorded_timeframe, legacy["id"]),
+                    )
+
             for symbol in symbols:
                 conn.execute(
                     "INSERT OR IGNORE INTO watchlist(symbol, enabled, created_at) VALUES (?, 1, ?)",
@@ -212,6 +248,31 @@ class Database:
             ).fetchall()
             return [self._proposal_row(row) for row in rows if row]
 
+    def list_open_position_backfill_starts(self, timeframe: str) -> list[dict[str, str]]:
+        """Return each open position's durable exit checkpoint (or its entry time)."""
+        if timeframe not in {"intraday", "swing"}:
+            raise ValueError("Unsupported position timeframe.")
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT symbol, COALESCE(last_processed_bar_at, opened_at) AS start_time "
+                "FROM positions WHERE status='open' AND timeframe=? ORDER BY symbol",
+                (timeframe,),
+            ).fetchall()
+            return [{"symbol": row["symbol"], "start_time": row["start_time"]} for row in rows]
+
+    def list_open_position_symbols(self, timeframe: str | None = None) -> list[str]:
+        with self.connect() as conn:
+            if timeframe is None:
+                rows = conn.execute(
+                    "SELECT DISTINCT symbol FROM positions WHERE status='open' ORDER BY symbol"
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT DISTINCT symbol FROM positions WHERE status='open' AND timeframe=? ORDER BY symbol",
+                    (timeframe,),
+                ).fetchall()
+            return [row["symbol"] for row in rows]
+
     def list_watchlist(self) -> list[str]:
         with self.connect() as conn:
             rows = conn.execute(
@@ -236,6 +297,7 @@ class Database:
     def save_bars(self, bars: list[dict[str, Any]], source: str, timeframe: str = "5Min") -> int:
         count = 0
         with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
             for bar in bars:
                 conn.execute(
                     "INSERT OR REPLACE INTO bars(symbol,timeframe,timestamp,open,high,low,close,volume,source) "
@@ -246,6 +308,7 @@ class Database:
                     ),
                 )
                 count += 1
+            conn.commit()
         return count
 
     def get_bars(
@@ -305,7 +368,8 @@ class Database:
 
     def approve_paper_trade(
         self, proposal_id: str, version: int, quantity: int, max_open_positions: int,
-        max_exposure_value: float,
+        max_exposure_value: float, *, simulated_fill_price: float | None = None,
+        slippage_bps: float = 0.0,
     ) -> dict[str, Any]:
         now = utc_now()
         with self.connect() as conn:
@@ -329,26 +393,40 @@ class Database:
             if any(r["symbol"] == body["symbol"] for r in open_positions):
                 conn.rollback()
                 raise ValueError("An open paper position already exists for this symbol.")
+            fill_price = float(
+                simulated_fill_price if simulated_fill_price is not None else body["entry_price"]
+            )
+            if not fill_price > 0:
+                conn.rollback()
+                raise ValueError("Simulated fill price must be positive.")
             gross_exposure = sum(r["quantity"] * r["current_price"] for r in open_positions)
-            new_exposure = quantity * body["entry_price"]
+            new_exposure = quantity * fill_price
             if gross_exposure + new_exposure > max_exposure_value:
                 conn.rollback()
                 raise ValueError("Exposure limit would be exceeded.")
             order_id, position_id = new_id("ord"), new_id("pos")
-            details = {"proposal_id": proposal_id, "proposal_version": version,
-                       "note": "Simulated fill at proposal entry; not a real market fill."}
+            details = {
+                "proposal_id": proposal_id,
+                "proposal_version": version,
+                "requested_entry_price": float(body["entry_price"]),
+                "simulated_fill_price": fill_price,
+                "fill_source": "latest_server_stored_bar_close_with_adverse_slippage",
+                "slippage_bps": float(slippage_bps),
+                "note": "Paper-only fill simulation; not a real market or broker fill.",
+            }
             conn.execute(
                 "INSERT INTO orders(id,proposal_id,symbol,side,quantity,status,simulated_price,created_at,details_json) "
                 "VALUES (?,?,?,?,?,'filled',?,?,?)",
                 (order_id, proposal_id, body["symbol"], body["side"], quantity,
-                 body["entry_price"], now, json.dumps(details)),
+                 fill_price, now, json.dumps(details)),
             )
             conn.execute(
                 "INSERT INTO positions(id,proposal_id,symbol,side,quantity,entry_price,current_price,"
-                "stop_loss,take_profit,status,opened_at) VALUES (?,?,?,?,?,?,?,?,?,'open',?)",
+                "stop_loss,take_profit,status,opened_at,timeframe) "
+                "VALUES (?,?,?,?,?,?,?,?,?,'open',?,?)",
                 (position_id, proposal_id, body["symbol"], body["side"], quantity,
-                 body["entry_price"], body["entry_price"], body["stop_loss"],
-                 body["take_profit"], now),
+                 fill_price, fill_price, body["stop_loss"], body["take_profit"], now,
+                 body.get("timeframe", "intraday")),
             )
             conn.execute(
                 "UPDATE proposals SET status='approved',updated_at=? WHERE id=?",
@@ -356,7 +434,9 @@ class Database:
             )
             conn.commit()
             return {"order_id": order_id, "position_id": position_id, "status": "filled",
-                    "mode": "paper", "quantity": quantity, "simulated_price": body["entry_price"]}
+                    "mode": "paper", "quantity": quantity, "simulated_price": fill_price,
+                    "requested_entry_price": float(body["entry_price"]),
+                    "slippage_bps": float(slippage_bps)}
 
     def reject_proposal(self, proposal_id: str, version: int) -> dict[str, Any]:
         with self.connect() as conn:
@@ -382,8 +462,9 @@ class Database:
             ).fetchall()
             return [{**dict(r), "details": json.loads(r["details_json"])} for r in rows]
 
-    def close_position(self, position_id: str, exit_price: float) -> dict[str, Any]:
-        if exit_price <= 0:
+    def close_position(self, position_id: str, exit_price: float | None = None) -> dict[str, Any]:
+        """Close a paper position; None means use the server-recorded mark, never a client price."""
+        if exit_price is not None and (not isinstance(exit_price, (int, float)) or exit_price <= 0):
             raise ValueError("Exit price must be positive.")
         now = utc_now()
         with self.connect() as conn:
@@ -395,15 +476,27 @@ class Database:
             if row["status"] != "open":
                 conn.rollback()
                 raise ValueError("Position is already closed.")
+            pricing_method = "explicit_test_price"
+            if exit_price is None:
+                exit_price = float(row["current_price"])
+                pricing_method = "last_recorded_server_mark"
             sign = 1 if row["side"] == "long" else -1
-            pnl = (exit_price - row["entry_price"]) * row["quantity"] * sign
+            pnl = (float(exit_price) - row["entry_price"]) * row["quantity"] * sign
+            bar_timeframe = "1Day" if row["timeframe"] == "swing" else "5Min"
+            bar_row = conn.execute(
+                "SELECT timestamp FROM bars WHERE symbol=? AND timeframe=? ORDER BY timestamp DESC LIMIT 1",
+                (row["symbol"], bar_timeframe),
+            ).fetchone()
             conn.execute(
                 "UPDATE positions SET current_price=?,status='closed',closed_at=?,realized_pnl=? WHERE id=?",
-                (exit_price, now, pnl, position_id),
+                (float(exit_price), now, pnl, position_id),
             )
             conn.commit()
             return {"position_id": position_id, "status": "closed",
-                    "simulated_exit_price": exit_price, "realized_pnl": pnl}
+                    "simulated_exit_price": float(exit_price), "realized_pnl": pnl,
+                    "pricing_method": pricing_method,
+                    "mark_timestamp": bar_row["timestamp"] if bar_row else None,
+                    "mode": "paper"}
 
     def mark_position(self, symbol: str, price: float) -> None:
         if price <= 0:
@@ -414,12 +507,17 @@ class Database:
                 (price, symbol.upper()),
             )
 
-    def process_position_bar(self, bar: dict[str, Any]) -> list[dict[str, Any]]:
-        """Update one paper position mark and simulate stop/target exits from one completed OHLC bar.
+    def process_position_bar(
+        self, bar: dict[str, Any], timeframe: str = "intraday"
+    ) -> list[dict[str, Any]]:
+        """Process one OHLC bar only for positions using this analysis horizon.
 
+        timeframe is 'intraday' for five-minute bars and 'swing' for daily bars.
         If a bar touches both stop and target without an opening gap resolving the order,
         the stop is chosen first as a conservative assumption. This is paper simulation only.
         """
+        if timeframe not in {"intraday", "swing"}:
+            raise ValueError("Unsupported paper-position timeframe.")
         symbol = str(bar.get("symbol", "")).strip().upper()
         if not symbol:
             raise ValueError("A symbol is required to process a market bar.")
@@ -443,8 +541,8 @@ class Database:
         with self.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             rows = conn.execute(
-                "SELECT * FROM positions WHERE symbol=? AND status='open'",
-                (symbol,),
+                "SELECT * FROM positions WHERE symbol=? AND status='open' AND timeframe=?",
+                (symbol, timeframe),
             ).fetchall()
             for row in rows:
                 try:
@@ -457,6 +555,17 @@ class Database:
                 if bar_time <= opened_at.astimezone(UTC):
                     # Never replay pre-entry candles against a newly opened position.
                     continue
+                last_processed = row["last_processed_bar_at"]
+                if last_processed:
+                    try:
+                        checkpoint = datetime.fromisoformat(last_processed.replace("Z", "+00:00"))
+                    except ValueError:
+                        checkpoint = None
+                    if checkpoint is not None:
+                        if checkpoint.tzinfo is None:
+                            checkpoint = checkpoint.replace(tzinfo=UTC)
+                        if bar_time <= checkpoint.astimezone(UTC):
+                            continue
 
                 stop = float(row["stop_loss"])
                 target = float(row["take_profit"])
@@ -491,17 +600,18 @@ class Database:
 
                 if exit_price is None:
                     conn.execute(
-                        "UPDATE positions SET current_price=? WHERE id=? AND status='open'",
-                        (close, row["id"]),
+                        "UPDATE positions SET current_price=?,last_processed_bar_at=? "
+                        "WHERE id=? AND status='open'",
+                        (close, bar_time.isoformat(), row["id"]),
                     )
                     continue
 
                 sign = 1 if side == "long" else -1
                 pnl = (exit_price - float(row["entry_price"])) * int(row["quantity"]) * sign
                 conn.execute(
-                    "UPDATE positions SET current_price=?,status='closed',closed_at=?,realized_pnl=? "
-                    "WHERE id=? AND status='open'",
-                    (exit_price, bar_time.isoformat(), pnl, row["id"]),
+                    "UPDATE positions SET current_price=?,status='closed',closed_at=?,realized_pnl=?,"
+                    "last_processed_bar_at=? WHERE id=? AND status='open'",
+                    (exit_price, bar_time.isoformat(), pnl, bar_time.isoformat(), row["id"]),
                 )
                 exits.append({
                     "position_id": row["id"],
