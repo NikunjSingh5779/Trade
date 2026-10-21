@@ -56,12 +56,11 @@ class MarketMonitor:
         while not self._stop.is_set():
             regular_session = is_regular_us_session()
             try:
+                # First recover any position carried across a prior session because the
+                # app was offline; same-day positions are left untouched before 16:00 ET.
+                await self.close_intraday_positions_after_session()
                 if regular_session:
                     await self.run_once()
-                else:
-                    # End-of-session liquidation must run after 16:00 ET as well as
-                    # on startup after a missed session. It never creates new positions.
-                    await self.close_intraday_positions_after_session()
             except Exception as exc:
                 self.db.add_audit("market_scan.failed", {"error_type": type(exc).__name__})
             timeout = self.settings.market_scan_interval_seconds if regular_session else 60
@@ -130,6 +129,12 @@ class MarketMonitor:
                     start_time=start_time,
                 )
                 self.db.save_bars(final_bars, source="alpaca", timeframe="5Min")
+                if not final_bars:
+                    self.db.add_audit("paper_position.session_close_mark_refresh_failed", {
+                        "position_id": position["id"],
+                        "symbol": position["symbol"],
+                        "reason": "provider_returned_no_final_candles",
+                    })
                 for bar in final_bars:
                     if not is_completed_market_bar(bar, "intraday", current):
                         continue
