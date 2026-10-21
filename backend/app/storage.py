@@ -65,7 +65,8 @@ class Database:
                     stop_loss REAL NOT NULL, take_profit REAL NOT NULL,
                     status TEXT NOT NULL, opened_at TEXT NOT NULL, closed_at TEXT,
                     realized_pnl REAL NOT NULL DEFAULT 0,
-                    timeframe TEXT NOT NULL DEFAULT 'intraday'
+                    timeframe TEXT NOT NULL DEFAULT 'intraday',
+                    last_processed_bar_at TEXT
                 );
                 CREATE INDEX IF NOT EXISTS ix_positions_status ON positions(status);
                 CREATE TABLE IF NOT EXISTS watchlist (
@@ -96,6 +97,10 @@ class Database:
             if "timeframe" not in position_columns:
                 conn.execute(
                     "ALTER TABLE positions ADD COLUMN timeframe TEXT NOT NULL DEFAULT 'intraday'"
+                )
+            if "last_processed_bar_at" not in position_columns:
+                conn.execute(
+                    "ALTER TABLE positions ADD COLUMN last_processed_bar_at TEXT"
                 )
             legacy_positions = conn.execute(
                 "SELECT p.id, pr.body_json FROM positions p "
@@ -242,6 +247,18 @@ class Database:
                 "SELECT * FROM proposals ORDER BY created_at DESC LIMIT ?", (limit,)
             ).fetchall()
             return [self._proposal_row(row) for row in rows if row]
+
+    def list_open_position_backfill_starts(self, timeframe: str) -> list[dict[str, str]]:
+        """Return each open position's durable exit checkpoint (or its entry time)."""
+        if timeframe not in {"intraday", "swing"}:
+            raise ValueError("Unsupported position timeframe.")
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT symbol, COALESCE(last_processed_bar_at, opened_at) AS start_time "
+                "FROM positions WHERE status='open' AND timeframe=? ORDER BY symbol",
+                (timeframe,),
+            ).fetchall()
+            return [{"symbol": row["symbol"], "start_time": row["start_time"]} for row in rows]
 
     def list_open_position_symbols(self, timeframe: str | None = None) -> list[str]:
         with self.connect() as conn:
@@ -536,6 +553,17 @@ class Database:
                 if bar_time <= opened_at.astimezone(UTC):
                     # Never replay pre-entry candles against a newly opened position.
                     continue
+                last_processed = row["last_processed_bar_at"]
+                if last_processed:
+                    try:
+                        checkpoint = datetime.fromisoformat(last_processed.replace("Z", "+00:00"))
+                    except ValueError:
+                        checkpoint = None
+                    if checkpoint is not None:
+                        if checkpoint.tzinfo is None:
+                            checkpoint = checkpoint.replace(tzinfo=UTC)
+                        if bar_time <= checkpoint.astimezone(UTC):
+                            continue
 
                 stop = float(row["stop_loss"])
                 target = float(row["take_profit"])
@@ -570,17 +598,18 @@ class Database:
 
                 if exit_price is None:
                     conn.execute(
-                        "UPDATE positions SET current_price=? WHERE id=? AND status='open'",
-                        (close, row["id"]),
+                        "UPDATE positions SET current_price=?,last_processed_bar_at=? "
+                        "WHERE id=? AND status='open'",
+                        (close, bar_time.isoformat(), row["id"]),
                     )
                     continue
 
                 sign = 1 if side == "long" else -1
                 pnl = (exit_price - float(row["entry_price"])) * int(row["quantity"]) * sign
                 conn.execute(
-                    "UPDATE positions SET current_price=?,status='closed',closed_at=?,realized_pnl=? "
-                    "WHERE id=? AND status='open'",
-                    (exit_price, bar_time.isoformat(), pnl, row["id"]),
+                    "UPDATE positions SET current_price=?,status='closed',closed_at=?,realized_pnl=?,"
+                    "last_processed_bar_at=? WHERE id=? AND status='open'",
+                    (exit_price, bar_time.isoformat(), pnl, bar_time.isoformat(), row["id"]),
                 )
                 exits.append({
                     "position_id": row["id"],
