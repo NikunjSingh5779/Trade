@@ -58,9 +58,11 @@ class Settings(BaseSettings):
     risk_per_trade_pct: float = Field(default=0.25, gt=0, le=1)
     daily_loss_limit_pct: float = Field(default=1.0, gt=0, le=10)
     max_open_positions: int = Field(default=5, ge=1, le=100)
-    max_position_value_pct: float = Field(default=20, gt=0, le=100)
+    max_position_value_pct: float = Field(default=10, gt=0, le=100)
+    max_gross_exposure_pct: float = Field(default=20, gt=0, le=100)
     min_reward_risk: float = Field(default=1.0, gt=0, le=10)
     max_entry_deviation_pct: float = Field(default=2.0, gt=0, le=50)
+    simulated_slippage_bps: float = Field(default=5.0, ge=0, le=100)
     require_approval_for_new_positions: bool = True
     auto_promote_strategies: bool = False
 
