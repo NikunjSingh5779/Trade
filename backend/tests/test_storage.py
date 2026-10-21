@@ -1,3 +1,6 @@
+import sqlite3
+from datetime import UTC, datetime
+
 import pytest
 
 from app.storage import Database
@@ -52,14 +55,17 @@ def test_market_bars_are_isolated_by_timeframe(tmp_path):
 
 
 
-def _insert_open_position(db, *, side="long", opened_at="2026-10-20T19:00:00+00:00"):
+def _insert_open_position(
+    db, *, side="long", timeframe="intraday", opened_at="2026-10-20T19:00:00+00:00"
+):
     with db.connect() as conn:
         conn.execute(
             "INSERT INTO positions(id,proposal_id,symbol,side,quantity,entry_price,current_price,"
-            "stop_loss,take_profit,status,opened_at) VALUES (?,?,?,?,?,?,?,?,?,'open',?)",
+            "stop_loss,take_profit,status,opened_at,timeframe) "
+            "VALUES (?,?,?,?,?,?,?,?,?,'open',?,?)",
             ("pos-test", "prop-test", "AAPL", side, 10, 100.0, 100.0,
              95.0 if side == "long" else 105.0,
-             110.0 if side == "long" else 90.0, opened_at),
+             110.0 if side == "long" else 90.0, opened_at, timeframe),
         )
 
 
@@ -143,3 +149,65 @@ def test_position_bar_before_entry_is_ignored(tmp_path):
     with db.connect() as conn:
         position = conn.execute("SELECT * FROM positions WHERE id='pos-test'").fetchone()
     assert position["status"] == "open"
+
+
+
+def test_database_connection_is_closed_after_context_exit(tmp_path):
+    db = Database(str(tmp_path / "test.db"))
+    with db.connect() as conn:
+        assert conn.execute("SELECT 1").fetchone()[0] == 1
+
+    with pytest.raises(sqlite3.ProgrammingError, match="closed"):
+        conn.execute("SELECT 1")
+
+
+def test_manual_close_can_use_only_the_recorded_server_mark(tmp_path):
+    db = Database(str(tmp_path / "test.db"))
+    db.initialize([])
+    _insert_open_position(db)
+    db.mark_position("AAPL", 101.25)
+
+    closed = db.close_position("pos-test", None)
+
+    assert closed["simulated_exit_price"] == 101.25
+    assert closed["pricing_method"] == "last_recorded_server_mark"
+    assert closed["realized_pnl"] == 12.5
+    with db.connect() as conn:
+        row = conn.execute("SELECT status, closed_at FROM positions WHERE id='pos-test'").fetchone()
+    assert row["status"] == "closed"
+    assert row["closed_at"] is not None
+
+
+def test_swing_position_is_evaluated_only_against_daily_bars(tmp_path):
+    db = Database(str(tmp_path / "test.db"))
+    db.initialize([])
+    _insert_open_position(db, timeframe="swing")
+    target_bar = _bar(high=111, close=109)
+
+    assert db.process_position_bar(target_bar, timeframe="intraday") == []
+    with db.connect() as conn:
+        assert conn.execute("SELECT status FROM positions WHERE id='pos-test'").fetchone()[0] == "open"
+
+    exits = db.process_position_bar(target_bar, timeframe="swing")
+    assert len(exits) == 1
+    assert exits[0]["reason"] == "take_profit"
+
+
+def test_legacy_positions_table_gets_timeframe_column_on_initialize(tmp_path):
+    path = str(tmp_path / "legacy.db")
+    with sqlite3.connect(path) as conn:
+        conn.execute("""
+            CREATE TABLE positions (
+                id TEXT PRIMARY KEY, proposal_id TEXT NOT NULL UNIQUE,
+                symbol TEXT NOT NULL, side TEXT NOT NULL, quantity INTEGER NOT NULL,
+                entry_price REAL NOT NULL, current_price REAL NOT NULL,
+                stop_loss REAL NOT NULL, take_profit REAL NOT NULL,
+                status TEXT NOT NULL, opened_at TEXT NOT NULL, closed_at TEXT,
+                realized_pnl REAL NOT NULL DEFAULT 0
+            )
+        """)
+    db = Database(path)
+    db.initialize([])
+    with db.connect() as conn:
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(positions)")}
+    assert "timeframe" in columns
