@@ -298,7 +298,7 @@ async def update_stops(position_id: str, request: UpdateStopsRequest) -> dict[st
                     status_code=422,
                     detail="Stop-loss cannot be widened for a short paper position.",
                 )
-            valid = request.take_profit < row["current_price"] < row["stop_loss"]
+            valid = request.take_profit < row["current_price"] < request.stop_loss
         if not valid:
             conn.rollback()
             raise HTTPException(
