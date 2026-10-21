@@ -65,7 +65,7 @@ class MarketMonitor:
                 self.db.add_audit("market_scan.failed", {"error_type": type(exc).__name__})
             try:
                 await asyncio.wait_for(
-                    self._stop.wait(), timeout=min(self.settings.market_scan_interval_seconds, 60)
+                    self._stop.wait(), timeout=self.settings.market_scan_interval_seconds
                 )
             except TimeoutError:
                 pass
