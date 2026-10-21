@@ -54,8 +54,9 @@ class MarketMonitor:
 
     async def run_forever(self) -> None:
         while not self._stop.is_set():
+            regular_session = is_regular_us_session()
             try:
-                if is_regular_us_session():
+                if regular_session:
                     await self.run_once()
                 else:
                     # End-of-session liquidation must run after 16:00 ET as well as
@@ -63,10 +64,9 @@ class MarketMonitor:
                     await self.close_intraday_positions_after_session()
             except Exception as exc:
                 self.db.add_audit("market_scan.failed", {"error_type": type(exc).__name__})
+            timeout = self.settings.market_scan_interval_seconds if regular_session else 60
             try:
-                await asyncio.wait_for(
-                    self._stop.wait(), timeout=self.settings.market_scan_interval_seconds
-                )
+                await asyncio.wait_for(self._stop.wait(), timeout=timeout)
             except TimeoutError:
                 pass
 
@@ -231,7 +231,11 @@ class MarketMonitor:
             recent = self.db.get_bars(symbol, limit=100)
             completed = [
                 bar for bar in recent
-                if is_completed_market_bar(bar, "intraday") and is_regular_us_bar(bar)
+                if is_completed_market_bar(bar, "intraday")
+                and (
+                    not self.settings.autonomous_paper_trading_enabled
+                    or is_regular_us_bar(bar)
+                )
             ]
             if len(completed) < 10:
                 self.db.add_audit("market_scan.symbol_skipped_insufficient_completed_bars", {
@@ -300,4 +304,9 @@ class MarketMonitor:
             "interval_seconds": self.settings.market_scan_interval_seconds,
             "provider_configured": self.provider.configured,
             "regular_us_session": is_regular_us_session(),
+            "autonomous_paper_trading_enabled": self.settings.autonomous_paper_trading_enabled,
+            "autonomous_symbols": self.settings.autonomous_symbol_list,
+            "automated_entries_timeframe": "intraday",
+            "end_of_session_exit_enabled": self.settings.autonomous_paper_trading_enabled,
+            "live_trading_enabled": self.settings.live_trading_enabled,
         }
