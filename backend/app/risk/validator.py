@@ -18,6 +18,7 @@ def validate_and_size(
     max_open_positions: int,
     max_position_value_pct: float,
     min_reward_risk: float,
+    max_gross_exposure_pct: float | None = None,
 ) -> tuple[TradeProposal, int, float]:
     # Database records include lifecycle metadata; validate only the model's proposal fields.
     candidate = {key: raw_proposal[key] for key in TradeProposal.model_fields if key in raw_proposal}
@@ -39,11 +40,19 @@ def validate_and_size(
 
     risk_budget = equity * risk_per_trade_pct / 100
     quantity_by_risk = floor(risk_budget / risk_per_share)
-    max_gross_exposure = equity * max_position_value_pct / 100
+
+    # A per-position cap and the portfolio-wide gross-exposure cap are separate constraints.
+    max_position_exposure = equity * max_position_value_pct / 100
+    quantity_by_position = floor(max_position_exposure / proposal.entry_price)
+    gross_cap_pct = max_position_value_pct if max_gross_exposure_pct is None else max_gross_exposure_pct
+    max_gross_exposure = equity * gross_cap_pct / 100
     exposure_remaining = max(0.0, max_gross_exposure - total_gross_exposure)
-    quantity_by_exposure = floor(exposure_remaining / proposal.entry_price)
-    quantity = min(quantity_by_risk, quantity_by_exposure)
+    quantity_by_gross_exposure = floor(exposure_remaining / proposal.entry_price)
+    quantity = min(quantity_by_risk, quantity_by_position, quantity_by_gross_exposure)
     if quantity < 1:
-        raise RiskRejected("Risk budget or gross-exposure limit is too small for one share.")
+        raise RiskRejected(
+            "Risk budget, per-position allocation, or remaining gross-exposure limit "
+            "is too small for one share."
+        )
     estimated_risk = quantity * risk_per_share
     return proposal, quantity, estimated_risk
