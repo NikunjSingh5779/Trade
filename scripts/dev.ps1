@@ -38,6 +38,7 @@ if ($frontendEnv -match "(?m)^NEXT_PUBLIC_API_BASE_URL=.*$") {
     $frontendEnv = $frontendEnv.TrimEnd() + [Environment]::NewLine + "NEXT_PUBLIC_API_BASE_URL=/api/backend" + [Environment]::NewLine
 }
 Set-Content -Path $frontendEnvPath -Value $frontendEnv -Encoding utf8
+$env:NEXT_PUBLIC_API_BASE_URL = "/api/backend"
 Start-Process powershell -ArgumentList "-NoExit", "-Command", "Set-Location '$root'; .\.venv\Scripts\Activate.ps1; python -m uvicorn app.main:app --app-dir backend --reload --host 127.0.0.1 --port 8000"
 Set-Location "$root\frontend"
 npm install
