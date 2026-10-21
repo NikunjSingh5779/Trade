@@ -50,7 +50,9 @@ class Settings(BaseSettings):
     market_scan_enabled: bool = True
     market_scan_interval_seconds: int = Field(default=300, ge=60, le=3600)
     max_stale_data_seconds: int = Field(default=600, ge=60, le=86400)
-    watchlist_symbols: str = "SPY,QQQ,AAPL,MSFT"
+    watchlist_symbols: str = "AAPL,MSFT,NVDA,TSLA,GOOGL,AMZN,META,AMD,MU"
+    autonomous_paper_trading_enabled: bool = True
+    autonomous_trading_symbols: str = "AAPL,MSFT,NVDA,TSLA,GOOGL,AMZN,META,AMD,MU"
     news_rss_urls: str = ""
     economic_events_rss_urls: str = ""
     news_feed_timeout_seconds: float = Field(default=8.0, ge=1, le=30)
@@ -64,7 +66,6 @@ class Settings(BaseSettings):
     min_reward_risk: float = Field(default=1.0, gt=0, le=10)
     max_entry_deviation_pct: float = Field(default=2.0, gt=0, le=50)
     simulated_slippage_bps: float = Field(default=5.0, ge=0, le=100)
-    require_approval_for_new_positions: bool = True
     auto_promote_strategies: bool = False
 
     @property
@@ -76,6 +77,14 @@ class Settings(BaseSettings):
         return list(dict.fromkeys(
             item.strip().upper()
             for item in self.watchlist_symbols.split(",")
+            if item.strip()
+        ))
+
+    @property
+    def autonomous_symbol_list(self) -> list[str]:
+        return list(dict.fromkeys(
+            item.strip().upper()
+            for item in self.autonomous_trading_symbols.split(",")
             if item.strip()
         ))
 
@@ -98,8 +107,6 @@ class Settings(BaseSettings):
                 "This build is paper-only: PAPER_TRADING_ONLY=true, "
                 "LIVE_TRADING_ENABLED=false, ALLOW_LIVE_ORDER_ENDPOINTS=false are mandatory."
             )
-        if not self.require_approval_for_new_positions:
-            raise ValueError("Phase 1 requires approval for every new paper position.")
         if self.auto_promote_strategies:
             raise ValueError("Automatic strategy promotion is not supported in Phase 1.")
         if self.hosted_fallback_enabled:
