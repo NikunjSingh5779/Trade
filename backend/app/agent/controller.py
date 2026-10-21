@@ -24,5 +24,9 @@ class AgentController:
                 result["structured"] = json.loads(text)
             except json.JSONDecodeError:
                 result["structured"] = None
-                result["parse_warning"] = "Model output was not valid JSON; no automated paper trade was created."
+                result["parse_warning"] = (
+                    "Model output was not valid JSON; no automated paper trade was created."
+                    if task == "market_scan"
+                    else "Model output was not valid JSON; no proposal was created."
+                )
         return result
