@@ -2,7 +2,7 @@
 
 ## Runtime
 
-The local application consists of a Next.js dashboard, a FastAPI backend, a SQLite database, one queue worker, one scheduled market monitor, and a model router. It is designed for use on the Windows machine's loopback interface.
+The local application consists of a Next.js dashboard, a FastAPI backend, a SQLite database, one queue worker, one scheduled market monitor, and a model router. It is designed for use on the Windows machine's loopback interface. Browser requests go through a same-origin Next.js proxy; the backend's high-entropy local bearer token stays on the server and is required for state-changing API requests. The `scripts/dev.ps1` launcher generates the token once in the ignored root `.env` file if absent.
 
 ## Single-agent rule
 
