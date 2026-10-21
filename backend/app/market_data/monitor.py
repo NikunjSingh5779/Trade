@@ -37,14 +37,34 @@ class MarketMonitor:
 
     async def run_once(self) -> dict[str, Any]:
         symbols = self.db.list_watchlist()
-        bars = await self.provider.fetch_bars(symbols)
+        # Fetch a full five-session window so an app restart does not silently skip
+        # stop/target crossings earlier in the current session.
+        bars = await self.provider.fetch_bars(symbols, timeframe="5Min", limit=1000)
         self.db.save_bars(bars, source="alpaca")
 
-        # Process each fetched candle oldest-first so exits use OHLC crossings,
-        # not merely the final close. The database ignores all pre-entry candles.
+        # Intraday positions are evaluated only against five-minute bars.
         for bar in bars:
-            for exit_event in self.db.process_position_bar(bar):
+            for exit_event in self.db.process_position_bar(bar, timeframe="intraday"):
                 self.db.add_audit("paper_position.auto_exit", exit_event)
+
+        # Swing positions use daily OHLC bars, not intraday candles. The historical
+        # window allows the engine to catch up after a normal overnight shutdown.
+        swing_symbols = self.db.list_open_position_symbols("swing")
+        if swing_symbols:
+            try:
+                daily_bars = await self.provider.fetch_bars(
+                    swing_symbols, timeframe="1Day", limit=100
+                )
+                self.db.save_bars(daily_bars, source="alpaca", timeframe="1Day")
+                for bar in daily_bars:
+                    for exit_event in self.db.process_position_bar(bar, timeframe="swing"):
+                        self.db.add_audit("paper_position.auto_exit", exit_event)
+            except Exception as exc:
+                # A daily-data failure must be visible but should not discard successful
+                # intraday bars or prevent the normal market scan from proceeding.
+                self.db.add_audit("paper_position.swing_exit_scan_failed", {
+                    "symbols": swing_symbols, "error_type": type(exc).__name__,
+                })
 
         summaries = []
         for symbol in symbols:
