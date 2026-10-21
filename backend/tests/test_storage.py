@@ -211,3 +211,23 @@ def test_legacy_positions_table_gets_timeframe_column_on_initialize(tmp_path):
     with db.connect() as conn:
         columns = {row["name"] for row in conn.execute("PRAGMA table_info(positions)")}
     assert "timeframe" in columns
+    assert "last_processed_bar_at" in columns
+
+
+
+def test_exit_checkpoint_prevents_an_older_bar_from_rewinding_the_mark(tmp_path):
+    db = Database(str(tmp_path / "checkpoint.db"))
+    db.initialize([])
+    _insert_open_position(db)
+
+    first = _bar(timestamp="2026-10-20T19:05:00Z", close=101.0)
+    assert db.process_position_bar(first) == []
+    older = _bar(timestamp="2026-10-20T19:04:00Z", close=99.0)
+    assert db.process_position_bar(older) == []
+
+    with db.connect() as conn:
+        row = conn.execute(
+            "SELECT current_price, last_processed_bar_at FROM positions WHERE id='pos-test'"
+        ).fetchone()
+    assert row["current_price"] == 101.0
+    assert row["last_processed_bar_at"] == "2026-10-20T19:05:00+00:00"
