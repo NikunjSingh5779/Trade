@@ -27,9 +27,28 @@ TASK_PROMPTS = {
 }
 
 
+AUTONOMOUS_SCAN_PROMPT = (
+    "Review the supplied US-equity intraday data and make PAPER-TRADING decisions. "
+    "Return exactly one valid JSON object shaped as {\"decisions\":[...]}. Include exactly one decision "
+    "for every supplied symbol, and no symbols not supplied. Each decision must either be "
+    "{\"symbol\":\"AAPL\",\"decision\":\"no_trade\",\"reason\":\"...\"} or a trade object with "
+    "\"symbol\", \"decision\":\"trade\", \"side\":\"long\" or \"short\", \"entry_price\", "
+    "\"stop_loss\", \"take_profit\", \"thesis\", \"evidence\" (array of strings), and \"strategy_id\". "
+    "Do not include quantity. Every trade is intraday and must have a defensible stop and target on the "
+    "correct sides of entry. Entry must be close to the latest supplied completed candle close. Use only "
+    "supplied prices, timestamps, summaries, news, and event evidence. If evidence is weak, inconsistent, "
+    "stale, or unclear, choose no_trade. Never force a trade. These are simulated paper trades only, "
+    "not live orders."
+)
+
+
 def build_messages(task: str, payload: dict) -> list[dict[str, str]]:
     import json
-    instruction = TASK_PROMPTS.get(task, TASK_PROMPTS["chat"])
+    instruction = (
+        AUTONOMOUS_SCAN_PROMPT
+        if task == "market_scan" and payload.get("autonomous_mode") is True
+        else TASK_PROMPTS.get(task, TASK_PROMPTS["chat"])
+    )
     return [
         {"role": "system", "content": SYSTEM_PROMPT + "\nTask: " + instruction},
         {"role": "user", "content": json.dumps(payload, ensure_ascii=False, default=str)},
