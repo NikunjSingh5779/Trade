@@ -89,9 +89,9 @@ async def test_swing_positions_use_daily_bars_and_exit_on_daily_crossing(tmp_pat
 
     await monitor.run_once()
 
-    assert ("AAPL",) not in provider.calls
-    assert provider.calls[0][1:] == ("5Min", 1000)
-    assert any(call[1:] == ("1Day", 100) for call in provider.calls)
+    assert len(provider.calls) == 2
+    assert provider.calls[0] == (["AAPL"], "5Min", 1000)
+    assert provider.calls[1] == (["AAPL"], "1Day", 100)
     with db.connect() as conn:
         row = conn.execute(
             "SELECT status, current_price, realized_pnl FROM positions WHERE id='pos-swing'"
