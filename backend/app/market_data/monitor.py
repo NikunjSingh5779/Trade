@@ -63,7 +63,13 @@ class MarketMonitor:
                     await self.run_once()
             except Exception as exc:
                 self.db.add_audit("market_scan.failed", {"error_type": type(exc).__name__})
-            timeout = self.settings.market_scan_interval_seconds if regular_session else 60
+            eastern_clock = datetime.now(_US_EASTERN).time().replace(tzinfo=None)
+            near_close = regular_session and eastern_clock >= time(15, 55)
+            timeout = (
+                60
+                if not regular_session or near_close
+                else self.settings.market_scan_interval_seconds
+            )
             try:
                 await asyncio.wait_for(self._stop.wait(), timeout=timeout)
             except TimeoutError:
@@ -80,8 +86,6 @@ class MarketMonitor:
         The routine also catches positions left open because the app was offline at 16:00 ET.
         It backfills completed regular-session candles before flattening any position that remains.
         """
-        if not self.settings.autonomous_paper_trading_enabled:
-            return []
         current = now or datetime.now(UTC)
         if current.tzinfo is None:
             current = current.replace(tzinfo=UTC)
