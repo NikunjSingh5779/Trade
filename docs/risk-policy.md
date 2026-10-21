@@ -15,6 +15,7 @@ This software is a research and simulation tool, not financial advice.
 - Stale, malformed, or illogical prices are rejected.
 - Strategy changes remain experiments and are never automatically promoted.
 - Credentials must never appear in source code, prompts, browser bundles, logs, or Git.
+- State-changing API requests require a server-side local bearer token and trusted localhost origin. The token is stored in the ignored root `.env` and forwarded only by the Next.js server-side proxy; it is not a `NEXT_PUBLIC_*` variable.
 
 ## Initial settings
 

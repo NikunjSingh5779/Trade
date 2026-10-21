@@ -1,4 +1,5 @@
 import asyncio
+import hmac
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from pathlib import Path
@@ -92,6 +93,33 @@ app.add_middleware(
     TrustedHostMiddleware,
     allowed_hosts=["127.0.0.1", "localhost", "testserver"],
 )
+
+
+@app.middleware("http")
+async def require_local_token_for_mutations(request, call_next):
+    """Authenticate API mutations using a token never bundled into browser JavaScript."""
+    if request.method in {"POST", "PUT", "PATCH", "DELETE"} and request.url.path.startswith("/api/"):
+        token = settings.local_api_token.strip()
+        if not token:
+            return JSONResponse(
+                status_code=503,
+                content={"detail": "Local API token is not configured. Start the app with scripts/dev.ps1."},
+            )
+        scheme, separator, supplied = request.headers.get("authorization", "").partition(" ")
+        if (
+            scheme.lower() != "bearer"
+            or not separator
+            or not hmac.compare_digest(supplied.strip(), token)
+        ):
+            return JSONResponse(
+                status_code=401,
+                content={"detail": "A valid local API bearer token is required."},
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        origin = request.headers.get("origin")
+        if origin and origin.rstrip("/") not in settings.cors_origin_list:
+            return JSONResponse(status_code=403, content={"detail": "Untrusted request origin."})
+    return await call_next(request)
 
 
 @app.get("/health", include_in_schema=False)
