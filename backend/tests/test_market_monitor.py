@@ -13,8 +13,8 @@ class FakeProvider:
     def __init__(self):
         self.calls = []
 
-    async def fetch_bars(self, symbols, timeframe="5Min", limit=50):
-        self.calls.append((list(symbols), timeframe, limit))
+    async def fetch_bars(self, symbols, timeframe="5Min", limit=50, start_time=None):
+        self.calls.append((list(symbols), timeframe, limit, start_time))
         now = datetime.now(UTC)
         bars = []
         for symbol in symbols:
@@ -70,7 +70,7 @@ async def test_monitor_fetches_a_backfill_window_for_intraday_exit_recovery(tmp_
 
     result = await monitor.run_once()
 
-    assert provider.calls[0] == (["AAPL"], "5Min", 1000)
+    assert provider.calls[0] == (["AAPL"], "5Min", 1000, None)
     assert result["status"] == "queued"
     assert result["bar_count"] == 12
 
@@ -90,8 +90,10 @@ async def test_swing_positions_use_daily_bars_and_exit_on_daily_crossing(tmp_pat
     await monitor.run_once()
 
     assert len(provider.calls) == 2
-    assert provider.calls[0] == (["AAPL"], "5Min", 1000)
-    assert provider.calls[1] == (["AAPL"], "1Day", 100)
+    assert provider.calls[0][:3] == (["AAPL"], "5Min", 1000)
+    assert provider.calls[0][3] is None
+    assert provider.calls[1][:3] == (["AAPL"], "1Day", 10000)
+    assert provider.calls[1][3] is not None
     with db.connect() as conn:
         row = conn.execute(
             "SELECT status, current_price, realized_pnl FROM positions WHERE id='pos-swing'"
