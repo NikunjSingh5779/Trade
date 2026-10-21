@@ -18,6 +18,7 @@ class Settings(BaseSettings):
     host: str = "127.0.0.1"
     port: int = 8000
     cors_origins: str = "http://localhost:3000,http://127.0.0.1:3000"
+    local_api_token: str = ""
 
     paper_trading_only: bool = True
     live_trading_enabled: bool = False
