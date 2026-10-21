@@ -9,6 +9,8 @@ This software is a research and simulation tool, not financial advice.
 - Every new paper position requires explicit approval for the current proposal version.
 - The backend revalidates the proposal when approving it.
 - The proposal's quantity is not trusted; share quantity is calculated by deterministic code.
+- A model proposal is saved only if its symbol and timeframe match the request and its entry is within `MAX_ENTRY_DEVIATION_PCT` of the latest close it was given; otherwise the analysis job fails with a `ProposalMismatch` error and nothing is stored.
+- Approval freshness is judged against the data timeframe stamped by the server (`data_timeframe`), never the model's own `timeframe` field. Proposals without that stamp cannot be approved and must be regenerated.
 - Duplicate approvals and duplicate proposal executions are rejected by an atomic SQLite transaction.
 - Stale, malformed, or illogical prices are rejected.
 - Strategy changes remain experiments and are never automatically promoted.
@@ -18,6 +20,7 @@ This software is a research and simulation tool, not financial advice.
 
 - Risk budget: 0.25% of simulated equity per trade.
 - Minimum reward-to-risk: 1.0.
+- Maximum entry deviation: 2% from the latest close (`MAX_ENTRY_DEVIATION_PCT`). The paper broker fills at the proposed entry, so an entry the market has not reached would book fictitious P&L.
 - Maximum open paper positions: 5.
 - Gross paper exposure cap: 20% of simulated equity.
 - Daily loss guard: blocks new positions when current-day realized paper P&L plus current unrealized paper P&L reaches the configured threshold. Day boundaries are UTC in Phase 1.

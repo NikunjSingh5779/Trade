@@ -19,7 +19,7 @@ A client timeout can leave ambiguity about whether a remote server continues gen
 3. Open paper positions are marked from the latest locally stored close when available.
 4. The monitor coalesces market-scan jobs by scan window and skips AI enqueuing if the queue is full, without skipping data collection.
 5. The queue worker claims one persistent job at a time and invokes the same agent controller.
-6. Proposal analysis only persists an idea if the model produces valid JSON matching the strict proposal schema.
+6. Proposal analysis only persists an idea if the model produces valid JSON matching the strict proposal schema, the requested symbol and timeframe, and an entry price near the latest close. The server stamps the data timeframe on the proposal, and approval freshness uses that stamp rather than the model's own label.
 7. Risk validation sizes shares using equity, stop distance, risk budget, daily loss, gross exposure, and max-open-position rules.
 8. A human approval is bound to proposal ID and version.
 9. The SQLite transaction inserts a simulated order and position exactly once, and marks the proposal approved.

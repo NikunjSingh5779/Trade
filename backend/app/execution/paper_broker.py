@@ -2,6 +2,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from app.config import Settings
+from app.market_data.freshness import MarketDataFreshnessError, max_age_seconds
 from app.risk.validator import RiskRejected, validate_and_size
 from app.storage import Database
 
@@ -39,11 +40,16 @@ class PaperBroker:
         age_seconds = (datetime.now(UTC) - data_time.astimezone(UTC)).total_seconds()
         if age_seconds < -60:
             raise RiskRejected("Proposal references a future market-data timestamp.")
-        max_age = (
-            self.settings.max_stale_data_seconds
-            if proposal_record.get("timeframe") == "intraday"
-            else 7 * 24 * 60 * 60
-        )
+        # The model's own `timeframe` field is untrusted; only the data timeframe stamped by
+        # the server when the proposal was created may choose the staleness limit.
+        try:
+            max_age = max_age_seconds(
+                proposal_record.get("data_timeframe"), self.settings.max_stale_data_seconds
+            )
+        except MarketDataFreshnessError as exc:
+            raise RiskRejected(
+                "Proposal has no verifiable data timeframe; re-run the analysis."
+            ) from exc
         if age_seconds > max_age:
             raise RiskRejected(
                 f"Proposal market data is stale ({int(age_seconds)} seconds); limit is {max_age}."

@@ -35,7 +35,8 @@ db = Database(settings.database_path)
 router = InferenceRouter(settings, InferenceGate(settings.inference_lock_path))
 agent = AgentController(router)
 worker = QueueWorker(
-    db, agent, settings.ai_queue_max_pending, settings.max_stale_data_seconds
+    db, agent, settings.ai_queue_max_pending, settings.max_stale_data_seconds,
+    max_entry_deviation_pct=settings.max_entry_deviation_pct,
 )
 market_provider = AlpacaMarketData(settings)
 feed_service = ConfiguredFeedService(settings)
