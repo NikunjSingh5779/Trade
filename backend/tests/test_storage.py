@@ -1,5 +1,4 @@
 import sqlite3
-from datetime import UTC, datetime
 
 import pytest
 
