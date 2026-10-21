@@ -297,6 +297,7 @@ class Database:
     def save_bars(self, bars: list[dict[str, Any]], source: str, timeframe: str = "5Min") -> int:
         count = 0
         with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
             for bar in bars:
                 conn.execute(
                     "INSERT OR REPLACE INTO bars(symbol,timeframe,timestamp,open,high,low,close,volume,source) "
@@ -307,6 +308,7 @@ class Database:
                     ),
                 )
                 count += 1
+            conn.commit()
         return count
 
     def get_bars(
