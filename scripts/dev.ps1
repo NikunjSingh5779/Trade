@@ -11,7 +11,7 @@ if (-not (Test-Path ".env")) { Copy-Item ".env.example" ".env" }
 $envPath = Join-Path $root ".env"
 $envText = Get-Content -Raw -Path $envPath
 $tokenMatch = [regex]::Match($envText, "(?m)^LOCAL_API_TOKEN\s*=\s*(.*)$")
-$localToken = if ($tokenMatch.Success) { $tokenMatch.Groups[1].Value.Trim() } else { "" }
+$localToken = if ($tokenMatch.Success) { $tokenMatch.Groups[1].Value.Trim().Trim('"').Trim("'") } else { "" }
 if ([string]::IsNullOrWhiteSpace($localToken) -or $localToken -eq "CHANGE_ME") {
     $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
     $tokenBytes = New-Object byte[] 32
@@ -23,7 +23,8 @@ if ([string]::IsNullOrWhiteSpace($localToken) -or $localToken -eq "CHANGE_ME") {
     } else {
         $envText = $envText.TrimEnd() + [Environment]::NewLine + "LOCAL_API_TOKEN=$localToken" + [Environment]::NewLine
     }
-    Set-Content -Path $envPath -Value $envText -Encoding utf8
+    $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
+    [System.IO.File]::WriteAllText($envPath, $envText, $utf8NoBom)
 }
 $env:LOCAL_API_TOKEN = $localToken
 
@@ -37,7 +38,8 @@ if ($frontendEnv -match "(?m)^NEXT_PUBLIC_API_BASE_URL=.*$") {
 } else {
     $frontendEnv = $frontendEnv.TrimEnd() + [Environment]::NewLine + "NEXT_PUBLIC_API_BASE_URL=/api/backend" + [Environment]::NewLine
 }
-Set-Content -Path $frontendEnvPath -Value $frontendEnv -Encoding utf8
+$utf8NoBom = [System.Text.UTF8Encoding]::new($false)
+[System.IO.File]::WriteAllText($frontendEnvPath, $frontendEnv, $utf8NoBom)
 $env:NEXT_PUBLIC_API_BASE_URL = "/api/backend"
 Start-Process powershell -ArgumentList "-NoExit", "-Command", "Set-Location '$root'; .\.venv\Scripts\Activate.ps1; python -m uvicorn app.main:app --app-dir backend --reload --host 127.0.0.1 --port 8000"
 Set-Location "$root\frontend"
