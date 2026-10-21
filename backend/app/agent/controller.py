@@ -19,10 +19,10 @@ class AgentController:
             "text": text,
             "provider": provider,
         }
-        if task == "analyze_proposal":
+        if task == "analyze_proposal" or (task == "market_scan" and payload.get("autonomous_mode") is True):
             try:
                 result["structured"] = json.loads(text)
             except json.JSONDecodeError:
                 result["structured"] = None
-                result["parse_warning"] = "Model output was not valid JSON; no proposal was created."
+                result["parse_warning"] = "Model output was not valid JSON; no automated paper trade was created."
         return result
