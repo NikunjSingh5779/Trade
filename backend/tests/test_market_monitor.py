@@ -52,6 +52,7 @@ def _setup(tmp_path):
         database_path=str(tmp_path / "monitor.db"),
         inference_lock_path=str(tmp_path / "infer.lock"),
         watchlist_symbols="AAPL",
+        autonomous_paper_trading_enabled=False,
         market_scan_enabled=False,
         max_stale_data_seconds=600,
         news_rss_urls="",
