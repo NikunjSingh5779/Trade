@@ -7,6 +7,7 @@ from app.market_data.freshness import (
   )
 from app.risk.validator import RiskRejected, validate_and_size
 from app.storage import Database
+from app.market_data.sessions import is_regular_us_session
 
 
 class PaperBroker:
@@ -16,13 +17,18 @@ class PaperBroker:
         self.settings = settings
         self.db = db
 
-    def approve(self, proposal_id: str, version: int) -> dict[str, Any]:
+    def approve(
+        self, proposal_id: str, version: int, *, automated: bool = False
+    ) -> dict[str, Any]:
         if not self.settings.paper_trading_only:
             raise RuntimeError("Safety invariant violated: only paper mode is supported.")
         if self.settings.live_trading_enabled or self.settings.allow_live_order_endpoints:
             raise RuntimeError("Live trading configuration is forbidden in this build.")
-        if not self.settings.require_approval_for_new_positions:
-            raise RuntimeError("Phase 1 requires user approval for every new position.")
+        if automated:
+            if not self.settings.autonomous_paper_trading_enabled:
+                raise RuntimeError("Autonomous paper trading is disabled.")
+            if not is_regular_us_session():
+                raise RiskRejected("Automated entries are allowed only during regular US market hours.")
 
         proposal_record = self.db.get_proposal(proposal_id)
         if proposal_record is None:
@@ -60,6 +66,14 @@ class PaperBroker:
         # Recheck the current server-stored market mark at approval time. The requested entry
         # is not treated as an automatically achieved fill price.
         data_timeframe = proposal_record.get("data_timeframe")
+        if automated and (
+            data_timeframe != "intraday"
+            or proposal_record.get("timeframe") != "intraday"
+            or proposal_record.get("symbol") not in self.settings.autonomous_symbol_list
+        ):
+            raise RiskRejected(
+                "Automated entries must be intraday and use the configured autonomous symbol universe."
+            )
         bar_timeframe = "1Day" if data_timeframe == "swing" else "5Min"
         latest_bars = self.db.get_bars(
             proposal_record["symbol"], limit=1, timeframe=bar_timeframe
