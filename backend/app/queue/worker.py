@@ -5,18 +5,20 @@ from app.agent.controller import AgentController
 from app.agent.schemas import TradeProposal
 from app.inference.gate import InferenceGateBusy
 from app.market_data.freshness import ensure_fresh_bars
+from app.risk.consistency import check_proposal_consistency
 from app.storage import Database, utc_now
 
 
 class QueueWorker:
     def __init__(
         self, db: Database, agent: AgentController, max_pending: int = 100,
-        max_stale_data_seconds: int = 600,
+        max_stale_data_seconds: int = 600, max_entry_deviation_pct: float = 2.0,
     ):
         self.db = db
         self.agent = agent
         self.max_pending = max_pending
         self.max_stale_data_seconds = max_stale_data_seconds
+        self.max_entry_deviation_pct = max_entry_deviation_pct
         self._stop = asyncio.Event()
 
     async def run_forever(self) -> None:
@@ -51,18 +53,26 @@ class QueueWorker:
 
     async def _process(self, task: str, payload: dict[str, Any]) -> dict[str, Any]:
         if task == "analyze_proposal":
-            ensure_fresh_bars(
-                payload.get("bars", []),
-                str(payload.get("timeframe", "intraday")),
-                self.max_stale_data_seconds,
-            )
+            timeframe = str(payload.get("timeframe", "intraday"))
+            bars = payload.get("bars", [])
+            ensure_fresh_bars(bars, timeframe, self.max_stale_data_seconds)
             result = await self.agent.run(task, payload)
             structured = result.get("structured")
             if isinstance(structured, dict) and not structured.get("no_setup"):
-                proposal = TradeProposal.model_validate(structured)
+                # The request decides the horizon: a model that omits `timeframe` inherits it,
+                # and one that names a different horizon is rejected by the check below.
+                proposal = TradeProposal.model_validate({"timeframe": timeframe, **structured})
+                check_proposal_consistency(
+                    proposal,
+                    symbol=payload.get("symbol"),
+                    timeframe=timeframe,
+                    latest_close=bars[-1].get("close"),
+                    max_entry_deviation_pct=self.max_entry_deviation_pct,
+                )
                 proposal_body = proposal.model_dump()
-                bars = payload.get("bars", [])
-                proposal_body["data_asof"] = bars[-1].get("timestamp") if bars else None
+                proposal_body["data_asof"] = bars[-1].get("timestamp")
+                # Server-owned: approval freshness must never depend on the model's own label.
+                proposal_body["data_timeframe"] = timeframe
                 proposal_body["data_source"] = "configured_market_data_provider"
                 saved = self.db.add_proposal(proposal_body)
                 result["proposal"] = saved

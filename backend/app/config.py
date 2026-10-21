@@ -60,6 +60,7 @@ class Settings(BaseSettings):
     max_open_positions: int = Field(default=5, ge=1, le=100)
     max_position_value_pct: float = Field(default=20, gt=0, le=100)
     min_reward_risk: float = Field(default=1.0, gt=0, le=10)
+    max_entry_deviation_pct: float = Field(default=2.0, gt=0, le=50)
     require_approval_for_new_positions: bool = True
     auto_promote_strategies: bool = False
 

@@ -90,3 +90,21 @@ async def test_daily_bars_request_a_year_of_history():
     assert captured["timeframe"] == "1Day"
     assert captured["limit"] == "100"
     assert (end - start).days >= 364
+
+
+def test_swing_bars_may_be_up_to_a_week_old():
+    now = datetime(2026, 10, 20, 20, 0, tzinfo=UTC)
+    three_days = [{"timestamp": (now - timedelta(days=3)).isoformat()}]
+    eight_days = [{"timestamp": (now - timedelta(days=8)).isoformat()}]
+
+    ensure_fresh_bars(three_days, "swing", 600, now=now)
+    with pytest.raises(MarketDataFreshnessError, match="stale"):
+        ensure_fresh_bars(eight_days, "swing", 600, now=now)
+
+
+def test_unknown_timeframe_fails_closed_instead_of_getting_the_swing_limit():
+    now = datetime(2026, 10, 20, 20, 0, tzinfo=UTC)
+    bars = [{"timestamp": (now - timedelta(minutes=2)).isoformat()}]
+
+    with pytest.raises(MarketDataFreshnessError, match="Unsupported timeframe"):
+        ensure_fresh_bars(bars, "weekly", 600, now=now)

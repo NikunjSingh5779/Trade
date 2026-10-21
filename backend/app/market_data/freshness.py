@@ -1,9 +1,22 @@
 from datetime import UTC, datetime
 from typing import Any
 
+SWING_MAX_AGE_SECONDS = 7 * 24 * 60 * 60
+
 
 class MarketDataFreshnessError(ValueError):
     """Raised when stored bars cannot safely support the requested analysis."""
+
+
+def max_age_seconds(timeframe: Any, intraday_limit_seconds: int) -> int:
+    """Maximum data age for a timeframe. Anything but intraday/swing fails closed."""
+    if timeframe == "intraday":
+        return intraday_limit_seconds
+    if timeframe == "swing":
+        return SWING_MAX_AGE_SECONDS
+    raise MarketDataFreshnessError(
+        f"Unsupported timeframe {timeframe!r}; expected 'intraday' or 'swing'."
+    )
 
 
 def ensure_fresh_bars(
@@ -35,7 +48,7 @@ def ensure_fresh_bars(
     if age_seconds < -60:
         raise MarketDataFreshnessError("Market data timestamp is in the future; analysis was blocked.")
 
-    max_age = max_stale_data_seconds if timeframe == "intraday" else 7 * 24 * 60 * 60
+    max_age = max_age_seconds(timeframe, max_stale_data_seconds)
     if age_seconds > max_age:
         raise MarketDataFreshnessError(
             f"Stored market bars are stale ({int(age_seconds)} seconds old; limit is {max_age}). "
