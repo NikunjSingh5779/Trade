@@ -111,3 +111,14 @@ def test_mutation_routes_fail_closed_when_token_is_not_configured(monkeypatch):
         json={"message": "test"},
     )
     assert response.status_code == 503
+
+
+
+def test_mutation_routes_reject_invalid_bearer_token(monkeypatch):
+    monkeypatch.setattr(main.settings, "local_api_token", "test-local-token")
+    response = TestClient(main.app).post(
+        "/api/chat",
+        json={"message": "test"},
+        headers={"authorization": "Bearer wrong-token"},
+    )
+    assert response.status_code == 401
