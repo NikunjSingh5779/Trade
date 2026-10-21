@@ -17,7 +17,11 @@ type InferenceStatus = {
   local_available: boolean; local_endpoints: Array<{ base_url: string; model_id: string }>;
   hosted_fallback_enabled: boolean; selected_mode: string; inference_concurrency_limit: number;
 };
-type MarketStatus = { enabled: boolean; interval_seconds: number; provider_configured: boolean; regular_us_session: boolean };
+type MarketStatus = {
+  enabled: boolean; interval_seconds: number; provider_configured: boolean; regular_us_session: boolean;
+  autonomous_paper_trading_enabled?: boolean; autonomous_symbols?: string[];
+  automated_entries_timeframe?: string; end_of_session_exit_enabled?: boolean; live_trading_enabled?: boolean;
+};
 
 const money = (n: number) => new Intl.NumberFormat("en-US", {
   style: "currency", currency: "USD", maximumFractionDigits: 2
@@ -114,7 +118,11 @@ export default function AgentDashboard() {
     setBusy("scan"); setNotice(""); setError("");
     try {
       const result = await api<{ status: string; bar_count?: number }>("/api/market/scan", { method: "POST" });
-      setNotice(result.status === "queued" ? `Market scan queued; ${result.bar_count ?? 0} bars stored.` : "Scan completed without bars.");
+      setNotice(result.status === "queued"
+        ? (market?.autonomous_paper_trading_enabled
+          ? `Autonomous paper scan queued; ${result.bar_count ?? 0} bars stored. Eligible decisions can open simulated positions after server-side risk checks.`
+          : `Market scan queued; ${result.bar_count ?? 0} bars stored.`)
+        : "Scan completed without bars.");
       await refresh();
     } catch (e) { setError(e instanceof Error ? e.message : "Market scan failed"); }
     finally { setBusy(""); }
@@ -142,6 +150,22 @@ export default function AgentDashboard() {
 
       {error && <div className="mb-5 flex items-start gap-2 rounded-xl border border-red-900 bg-red-950/40 p-3 text-sm text-red-200"><CircleAlert size={17} className="mt-0.5 shrink-0"/>{error}</div>}
       {notice && <div className="mb-5 rounded-xl border border-[#2f735d] bg-[#102b26] p-3 text-sm text-[#95f0c9]">{notice}</div>}
+
+      <Panel className="mb-5 p-4">
+        <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
+          <div>
+            <div className="flex items-center gap-2 text-sm font-semibold"><Bot size={16} className="text-[#75e0b2]"/> Autonomous intraday paper trading</div>
+            <p className="mt-1 max-w-4xl text-xs leading-5 text-[#8e9cb2]">AI chooses Long, Short, or No Trade from completed regular-session candles. Valid entries are simulated automatically only after backend risk checks; remaining intraday positions are closed at the US regular-session close. Live order placement is disabled.</p>
+            <div className="mt-3 flex flex-wrap gap-2">
+              {(market?.autonomous_symbols ?? []).map(ticker => <span key={ticker} className="rounded-md border border-[#2b3c54] bg-[#0a1220] px-2 py-1 text-[10px] font-semibold tracking-wide text-[#cbd6e7]">{ticker}</span>)}
+            </div>
+          </div>
+          <div className="flex shrink-0 flex-col gap-2 text-xs">
+            <span className={`rounded-full border px-3 py-1.5 text-center font-semibold ${market?.autonomous_paper_trading_enabled ? "border-[#2f735d] bg-[#102b26] text-[#95f0c9]" : "border-[#39465a] bg-[#121d2d] text-[#a8b5c8]"}`}>{market?.autonomous_paper_trading_enabled ? "AUTONOMOUS MODE ON" : "AUTONOMOUS MODE OFF"}</span>
+            <span className="text-center text-[#8e9cb2]">{market?.regular_us_session ? "US regular session open" : "Outside US regular session"}</span>
+          </div>
+        </div>
+      </Panel>
 
       <div className="mb-5 grid grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-4">
         {[
@@ -180,7 +204,7 @@ export default function AgentDashboard() {
 
           <Panel className="p-5">
             <div className="flex flex-col justify-between gap-3 sm:flex-row sm:items-center">
-              <SectionTitle icon={ShieldCheck} title="Trade approval queue" note={`${pending.length} awaiting review`}/>
+              <SectionTitle icon={ShieldCheck} title="Proposal review queue" note={`${pending.length} awaiting review · manual analyses`}/>
               <form onSubmit={analyze} className="flex items-center gap-2">
                 <div className="relative"><Search size={14} className="absolute left-3 top-1/2 -translate-y-1/2 text-[#71819a]"/><input value={symbol} onChange={e => setSymbol(e.target.value.toUpperCase())} maxLength={12} aria-label="Symbol to analyze" className="w-24 rounded-lg border border-[#2b3c54] bg-[#09111e] py-2 pl-8 pr-2 text-xs uppercase outline-none focus:border-[#75e0b2]"/></div>
                 <button disabled={busy === "analyze"} className="rounded-lg border border-[#39516c] px-3 py-2 text-xs hover:bg-[#162235] disabled:opacity-50">{busy === "analyze" ? "Queuing…" : "Analyze symbol"}</button>
