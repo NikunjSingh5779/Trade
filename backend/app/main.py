@@ -9,6 +9,7 @@ import httpx
 import portalocker
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.responses import JSONResponse
 
 from app.agent.controller import AgentController
@@ -87,8 +88,13 @@ app.add_middleware(
     allow_methods=["GET", "POST"],
     allow_headers=["Content-Type"],
 )
+app.add_middleware(
+    TrustedHostMiddleware,
+    allowed_hosts=["127.0.0.1", "localhost", "testserver"],
+)
 
 
+@app.get("/health", include_in_schema=False)
 @app.get("/api/health")
 async def health() -> dict[str, Any]:
     return {
@@ -182,6 +188,8 @@ async def get_bars(
 @app.post("/api/proposals/analyze", status_code=202)
 async def analyze_proposal(request: AnalyzeRequest) -> dict[str, Any]:
     symbol = request.symbol.strip().upper()
+    if db.active_queue_count() >= settings.ai_queue_max_pending:
+        raise HTTPException(status_code=429, detail="AI task queue is full; try again later.")
     data_timeframe = "1Day" if request.timeframe == "swing" else "5Min"
 
     # Swing analysis must use actual daily candles, not 5-minute bars relabeled
@@ -276,14 +284,26 @@ async def update_stops(position_id: str, request: UpdateStopsRequest) -> dict[st
             conn.rollback()
             raise HTTPException(status_code=409, detail="Position is already closed.")
         if row["side"] == "long":
+            if request.stop_loss < row["stop_loss"]:
+                conn.rollback()
+                raise HTTPException(
+                    status_code=422,
+                    detail="Stop-loss cannot be widened for a long paper position.",
+                )
             valid = request.stop_loss < row["current_price"] < request.take_profit
         else:
+            if request.stop_loss > row["stop_loss"]:
+                conn.rollback()
+                raise HTTPException(
+                    status_code=422,
+                    detail="Stop-loss cannot be widened for a short paper position.",
+                )
             valid = request.take_profit < row["current_price"] < row["stop_loss"]
         if not valid:
             conn.rollback()
             raise HTTPException(
                 status_code=422,
-                detail="Stops must bracket the current mark in the correct direction for the position side.",
+                detail="Updated stop and target must bracket the current server-recorded mark.",
             )
         conn.execute(
             "UPDATE positions SET stop_loss=?,take_profit=? WHERE id=?",
@@ -301,7 +321,9 @@ async def update_stops(position_id: str, request: UpdateStopsRequest) -> dict[st
 @app.post("/api/positions/{position_id}/close")
 async def close_position(position_id: str, request: ClosePositionRequest) -> dict[str, Any]:
     try:
-        result = db.close_position(position_id, request.simulated_exit_price)
+        # Never let the browser choose the price used to book simulated P&L.
+        # Close at the most recent server-recorded market mark instead.
+        result = db.close_position(position_id, None)
         db.add_audit("paper_position.closed", result)
         return result
     except KeyError as exc:
