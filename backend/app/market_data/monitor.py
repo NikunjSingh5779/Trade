@@ -1,6 +1,7 @@
 import asyncio
-from datetime import UTC, datetime
+from datetime import UTC, datetime, time, timedelta
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from app.agent.tools import summarize_bars
 from app.config import Settings
@@ -9,6 +10,38 @@ from app.market_data.feeds import ConfiguredFeedService
 from app.market_data.freshness import MarketDataFreshnessError, ensure_fresh_bars
 from app.market_data.sessions import current_scan_window, is_regular_us_session
 from app.storage import Database
+
+
+_US_EASTERN = ZoneInfo("America/New_York")
+
+
+def is_completed_market_bar(
+    bar: dict[str, Any], position_horizon: str, now: datetime | None = None
+) -> bool:
+    """Fail closed on unfinished candles so checkpoints never freeze a forming bar."""
+    try:
+        stamp = datetime.fromisoformat(str(bar["timestamp"]).replace("Z", "+00:00"))
+    except (KeyError, TypeError, ValueError):
+        return False
+    if stamp.tzinfo is None:
+        stamp = stamp.replace(tzinfo=UTC)
+    stamp = stamp.astimezone(UTC)
+    current = now or datetime.now(UTC)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=UTC)
+    current = current.astimezone(UTC)
+
+    if position_horizon == "intraday":
+        # Alpaca timestamps five-minute bars at their start.
+        return stamp <= current - timedelta(minutes=5)
+    if position_horizon == "swing":
+        bar_date = stamp.astimezone(_US_EASTERN).date()
+        now_eastern = current.astimezone(_US_EASTERN)
+        return (
+            bar_date < now_eastern.date()
+            or (bar_date == now_eastern.date() and now_eastern.time() >= time(16, 10))
+        )
+    return False
 
 
 class MarketMonitor:
@@ -68,6 +101,8 @@ class MarketMonitor:
                         exit_bars, source="alpaca", timeframe=provider_timeframe
                     )
                     for bar in exit_bars:
+                        if not is_completed_market_bar(bar, position_horizon):
+                            continue
                         for exit_event in self.db.process_position_bar(
                             bar, timeframe=position_horizon
                         ):
