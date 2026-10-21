@@ -21,7 +21,8 @@ class AlpacaMarketData:
         return bool(self.settings.market_data_api_key and self.settings.market_data_api_secret)
 
     async def fetch_bars(
-        self, symbols: list[str], timeframe: str = "5Min", limit: int = 50
+        self, symbols: list[str], timeframe: str = "5Min", limit: int = 50,
+        start_time: datetime | None = None,
     ) -> list[dict[str, Any]]:
         if not self.configured:
             raise MarketDataUnavailable(
@@ -38,7 +39,17 @@ class AlpacaMarketData:
         per_symbol_limit = max(1, min(int(limit), 10000))
         end = datetime.now(UTC)
         lookback_days = 365 if timeframe == "1Day" else 5
-        start = end - timedelta(days=lookback_days)
+        start = (
+            start_time.astimezone(UTC)
+            if start_time is not None and start_time.tzinfo is not None
+            else start_time.replace(tzinfo=UTC)
+            if start_time is not None
+            else end - timedelta(days=lookback_days)
+        )
+        sort_order = "asc" if start_time is not None else "desc"
+        # Backfill calls paginate until the provider has returned every candle since
+        # the persisted checkpoint. Ordinary analysis calls retain their requested limit.
+        paginate = start_time is not None
         headers = {
             "APCA-API-KEY-ID": self.settings.market_data_api_key,
             "APCA-API-SECRET-KEY": self.settings.market_data_api_secret,
@@ -50,34 +61,44 @@ class AlpacaMarketData:
         # Fetch symbols independently so every watchlist entry gets its own limit.
         async with httpx.AsyncClient(timeout=20) as client:
             for symbol in requested:
-                params = {
-                    "symbols": symbol,
-                    "timeframe": timeframe,
-                    "limit": per_symbol_limit,
-                    "start": start.isoformat().replace("+00:00", "Z"),
-                    "end": end.isoformat().replace("+00:00", "Z"),
-                    "feed": self.settings.market_data_feed,
-                    "adjustment": "raw",
-                    "sort": "desc",
-                }
-                response = await client.get(
-                    f"{self.settings.market_data_base_url.rstrip('/')}/v2/stocks/bars",
-                    params=params,
-                    headers=headers,
-                )
-                response.raise_for_status()
-                body = response.json()
-                rows = body.get("bars", {}).get(symbol, []) if isinstance(body, dict) else []
-                for row in rows:
-                    bars.append({
-                        "symbol": symbol,
-                        "timestamp": str(row["t"]),
-                        "open": float(row["o"]),
-                        "high": float(row["h"]),
-                        "low": float(row["l"]),
-                        "close": float(row["c"]),
-                        "volume": float(row.get("v", 0)),
-                    })
+                page_token: str | None = None
+                seen_tokens: set[str] = set()
+                while True:
+                    params = {
+                        "symbols": symbol,
+                        "timeframe": timeframe,
+                        "limit": per_symbol_limit,
+                        "start": start.isoformat().replace("+00:00", "Z"),
+                        "end": end.isoformat().replace("+00:00", "Z"),
+                        "feed": self.settings.market_data_feed,
+                        "adjustment": "raw",
+                        "sort": sort_order,
+                    }
+                    if page_token:
+                        params["page_token"] = page_token
+                    response = await client.get(
+                        f"{self.settings.market_data_base_url.rstrip('/')}/v2/stocks/bars",
+                        params=params,
+                        headers=headers,
+                    )
+                    response.raise_for_status()
+                    body = response.json()
+                    rows = body.get("bars", {}).get(symbol, []) if isinstance(body, dict) else []
+                    for row in rows:
+                        bars.append({
+                            "symbol": symbol,
+                            "timestamp": str(row["t"]),
+                            "open": float(row["o"]),
+                            "high": float(row["h"]),
+                            "low": float(row["l"]),
+                            "close": float(row["c"]),
+                            "volume": float(row.get("v", 0)),
+                        })
+                    next_token = body.get("next_page_token") if isinstance(body, dict) else None
+                    if not paginate or not next_token or next_token in seen_tokens:
+                        break
+                    seen_tokens.add(next_token)
+                    page_token = str(next_token)
 
         # Return bars in chronological order for indicators and storage. Sorting
         # locally also protects consumers from provider response ordering changes.
