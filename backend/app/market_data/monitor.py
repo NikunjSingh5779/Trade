@@ -1,4 +1,5 @@
 import asyncio
+from datetime import UTC, datetime
 from typing import Any
 
 from app.agent.tools import summarize_bars
@@ -42,29 +43,43 @@ class MarketMonitor:
         bars = await self.provider.fetch_bars(symbols, timeframe="5Min", limit=1000)
         self.db.save_bars(bars, source="alpaca")
 
-        # Intraday positions are evaluated only against five-minute bars.
-        for bar in bars:
-            for exit_event in self.db.process_position_bar(bar, timeframe="intraday"):
-                self.db.add_audit("paper_position.auto_exit", exit_event)
-
-        # Swing positions use daily OHLC bars, not intraday candles. The historical
-        # window allows the engine to catch up after a normal overnight shutdown.
-        swing_symbols = self.db.list_open_position_symbols("swing")
-        if swing_symbols:
-            try:
-                daily_bars = await self.provider.fetch_bars(
-                    swing_symbols, timeframe="1Day", limit=100
-                )
-                self.db.save_bars(daily_bars, source="alpaca", timeframe="1Day")
-                for bar in daily_bars:
-                    for exit_event in self.db.process_position_bar(bar, timeframe="swing"):
-                        self.db.add_audit("paper_position.auto_exit", exit_event)
-            except Exception as exc:
-                # A daily-data failure must be visible but should not discard successful
-                # intraday bars or prevent the normal market scan from proceeding.
-                self.db.add_audit("paper_position.swing_exit_scan_failed", {
-                    "symbols": swing_symbols, "error_type": type(exc).__name__,
-                })
+        # Process exit candles from each position's durable checkpoint (or entry time).
+        # This catches up across longer shutdowns and paginates through all missing bars.
+        # Intraday positions use 5-minute bars; swing positions use daily bars.
+        exit_monitor_warnings: list[dict[str, str]] = []
+        for position_horizon, provider_timeframe in (
+            ("intraday", "5Min"),
+            ("swing", "1Day"),
+        ):
+            checkpoints = self.db.list_open_position_backfill_starts(position_horizon)
+            for checkpoint in checkpoints:
+                symbol = checkpoint["symbol"]
+                try:
+                    start_time = datetime.fromisoformat(
+                        checkpoint["start_time"].replace("Z", "+00:00")
+                    )
+                    if start_time.tzinfo is None:
+                        start_time = start_time.replace(tzinfo=UTC)
+                    exit_bars = await self.provider.fetch_bars(
+                        [symbol], timeframe=provider_timeframe, limit=10000,
+                        start_time=start_time,
+                    )
+                    self.db.save_bars(
+                        exit_bars, source="alpaca", timeframe=provider_timeframe
+                    )
+                    for bar in exit_bars:
+                        for exit_event in self.db.process_position_bar(
+                            bar, timeframe=position_horizon
+                        ):
+                            self.db.add_audit("paper_position.auto_exit", exit_event)
+                except Exception as exc:
+                    warning = {
+                        "symbol": symbol,
+                        "timeframe": position_horizon,
+                        "error_type": type(exc).__name__,
+                    }
+                    exit_monitor_warnings.append(warning)
+                    self.db.add_audit("paper_position.exit_backfill_failed", warning)
 
         summaries = []
         for symbol in symbols:
@@ -87,6 +102,7 @@ class MarketMonitor:
                 "status": "no_fresh_data",
                 "symbols_requested": symbols,
                 "bar_count": len(bars),
+                "exit_monitor_warnings": exit_monitor_warnings,
             }
         if self.db.active_queue_count() >= self.settings.ai_queue_max_pending:
             self.db.add_audit("market_scan.skipped", {
@@ -106,7 +122,10 @@ class MarketMonitor:
         self.db.add_audit("market_scan.completed", {
             "symbols_requested": len(symbols), "bars_received": len(bars), "job_id": job["id"],
         })
-        return {"status": "queued", "job_id": job["id"], "bar_count": len(bars)}
+        return {
+            "status": "queued", "job_id": job["id"], "bar_count": len(bars),
+            "exit_monitor_warnings": exit_monitor_warnings,
+        }
 
     def status(self) -> dict[str, Any]:
         return {
