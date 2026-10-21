@@ -1,4 +1,4 @@
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from app.config import Settings
@@ -7,7 +7,7 @@ from app.market_data.freshness import (
   )
 from app.risk.validator import RiskRejected, validate_and_size
 from app.storage import Database
-from app.market_data.sessions import is_regular_us_session
+from app.market_data.sessions import is_regular_us_bar, is_regular_us_session
 
 
 class PaperBroker:
@@ -76,10 +76,23 @@ class PaperBroker:
             )
         bar_timeframe = "1Day" if data_timeframe == "swing" else "5Min"
         latest_bars = self.db.get_bars(
-            proposal_record["symbol"], limit=1, timeframe=bar_timeframe
+            proposal_record["symbol"], limit=20 if automated else 1, timeframe=bar_timeframe
         )
+        if automated:
+            cutoff = datetime.now(UTC) - timedelta(minutes=5)
+            completed_bars = []
+            for bar in latest_bars:
+                try:
+                    stamp = datetime.fromisoformat(str(bar["timestamp"]).replace("Z", "+00:00"))
+                    if stamp.tzinfo is None:
+                        stamp = stamp.replace(tzinfo=UTC)
+                except (KeyError, TypeError, ValueError):
+                    continue
+                if stamp.astimezone(UTC) <= cutoff and is_regular_us_bar(bar):
+                    completed_bars.append(bar)
+            latest_bars = completed_bars[-1:]
         if not latest_bars:
-            raise RiskRejected("No stored market bar is available to price this paper fill.")
+            raise RiskRejected("No completed regular-session market bar is available to price this paper fill.")
         latest_bar = latest_bars[-1]
         try:
             ensure_fresh_bars(
