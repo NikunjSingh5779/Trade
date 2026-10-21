@@ -20,9 +20,10 @@ This software is a research and simulation tool, not financial advice.
 
 - Risk budget: 0.25% of simulated equity per trade.
 - Minimum reward-to-risk: 1.0.
-- Maximum entry deviation: 2% from the latest close (`MAX_ENTRY_DEVIATION_PCT`). The paper broker fills at the proposed entry, so an entry the market has not reached would book fictitious P&L.
+- Maximum entry deviation: 2% from the latest close (`MAX_ENTRY_DEVIATION_PCT`). At approval, the paper broker rechecks the latest stored bar, rejects an entry that has drifted beyond the configured deviation, and derives the simulated fill from that bar's close with adverse `SIMULATED_SLIPPAGE_BPS` applied.
+- Per-position allocation cap: `MAX_POSITION_VALUE_PCT` (default 10% of equity).
+- Aggregate gross paper exposure cap: `MAX_GROSS_EXPOSURE_PCT` (default 20% of equity).
 - Maximum open paper positions: 5.
-- Gross paper exposure cap: 20% of simulated equity.
 - Daily loss guard: blocks new positions when current-day realized paper P&L plus current unrealized paper P&L reaches the configured threshold. Day boundaries are UTC in Phase 1.
 - Stop loss and take profit are required for a proposal.
 - These values are initial engineering defaults, not recommendations for live capital.
@@ -37,8 +38,8 @@ For one share of a long or short position:
 
 `quantity_by_risk = floor(risk_budget / risk_per_share)`
 
-The share quantity is also constrained by remaining allowed gross exposure. The smaller valid quantity is used; if less than one share fits, the proposal is rejected.
+The share quantity is constrained independently by the risk budget, per-position allocation cap, and remaining aggregate gross exposure. The smallest valid quantity is used; if less than one share fits, the proposal is rejected. Risk is recalculated using the simulated fill price, not the model's requested entry.
 
 ## Simulation limitations
 
-Phase 1 fills at the proposed entry price and allows a user to close a simulated position at an explicitly supplied simulation price. These are not realistic execution guarantees. Partial fills, market gaps, borrow availability, short-sale rules, options, contract multipliers, taxes, fees and slippage require additional work before expanding instrument support.
+Phase 1 simulates an immediate fill at the latest server-stored market-bar close plus adverse entry slippage. A manual close uses the server-recorded position mark; the browser cannot choose the price booked to P&L. Automatic exits process completed OHLC candles from a durable per-position checkpoint, using five-minute bars for intraday positions and completed daily bars for swing positions. When one candle crosses both stop and target without a resolving opening gap, the stop is assumed first. These are still simulations, not broker orders or execution guarantees. Exit checks run only when the application fetches market data; they cannot run while the app is offline. Partial fills, per-exit slippage, fees, borrow availability, short-sale constraints, options and exchange-specific order rules require more work before expanding instrument support.
