@@ -4,6 +4,11 @@ from app import main
 from app.storage import Database
 
 
+def _auth(monkeypatch):
+    monkeypatch.setattr(main.settings, "local_api_token", "test-local-token")
+    return {"authorization": "Bearer test-local-token"}
+
+
 def _db_with_open_position(path):
     db = Database(str(path))
     db.initialize([])
@@ -25,12 +30,14 @@ def test_untrusted_host_is_rejected():
 
 
 def test_proposal_analysis_obeys_queue_limit(monkeypatch):
+    headers = _auth(monkeypatch)
     monkeypatch.setattr(
         main.db, "active_queue_count", lambda: main.settings.ai_queue_max_pending
     )
     response = TestClient(main.app).post(
         "/api/proposals/analyze",
         json={"symbol": "AAPL", "timeframe": "intraday"},
+        headers=headers,
     )
     assert response.status_code == 429
     assert "queue is full" in response.json()["detail"]
@@ -38,11 +45,13 @@ def test_proposal_analysis_obeys_queue_limit(monkeypatch):
 
 def test_close_endpoint_ignores_client_supplied_exit_price(monkeypatch, tmp_path):
     test_db = _db_with_open_position(tmp_path / "api.db")
+    headers = _auth(monkeypatch)
     monkeypatch.setattr(main, "db", test_db)
 
     response = TestClient(main.app).post(
         "/api/positions/pos-api/close",
         json={"simulated_exit_price": 999999.0},
+        headers=headers,
     )
 
     assert response.status_code == 200
@@ -55,10 +64,12 @@ def test_close_endpoint_ignores_client_supplied_exit_price(monkeypatch, tmp_path
 
 def test_stop_loss_cannot_be_widened_for_an_open_long(monkeypatch, tmp_path):
     test_db = _db_with_open_position(tmp_path / "stops.db")
+    headers = _auth(monkeypatch)
     monkeypatch.setattr(main, "db", test_db)
     response = TestClient(main.app).post(
         "/api/positions/pos-api/stops",
         json={"stop_loss": 94.0, "take_profit": 110.0},
+        headers=headers,
     )
     assert response.status_code == 422
     assert "cannot be widened" in response.json()["detail"]
@@ -69,13 +80,34 @@ def test_stop_loss_cannot_be_widened_for_an_open_long(monkeypatch, tmp_path):
 
 def test_stop_loss_can_be_tightened_for_an_open_long(monkeypatch, tmp_path):
     test_db = _db_with_open_position(tmp_path / "tighten.db")
+    headers = _auth(monkeypatch)
     monkeypatch.setattr(main, "db", test_db)
     response = TestClient(main.app).post(
         "/api/positions/pos-api/stops",
         json={"stop_loss": 98.0, "take_profit": 108.0},
+        headers=headers,
     )
     assert response.status_code == 200
     with test_db.connect() as conn:
         row = conn.execute("SELECT stop_loss, take_profit FROM positions WHERE id='pos-api'").fetchone()
     assert row["stop_loss"] == 98.0
     assert row["take_profit"] == 108.0
+
+
+
+def test_mutation_routes_require_local_bearer_token(monkeypatch):
+    monkeypatch.setattr(main.settings, "local_api_token", "test-local-token")
+    response = TestClient(main.app).post(
+        "/api/chat",
+        json={"message": "test"},
+    )
+    assert response.status_code == 401
+
+
+def test_mutation_routes_fail_closed_when_token_is_not_configured(monkeypatch):
+    monkeypatch.setattr(main.settings, "local_api_token", "")
+    response = TestClient(main.app).post(
+        "/api/chat",
+        json={"message": "test"},
+    )
+    assert response.status_code == 503
