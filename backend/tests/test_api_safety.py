@@ -122,3 +122,17 @@ def test_mutation_routes_reject_invalid_bearer_token(monkeypatch):
         headers={"authorization": "Bearer wrong-token"},
     )
     assert response.status_code == 401
+
+
+
+def test_mutation_routes_reject_untrusted_origin_even_with_token(monkeypatch):
+    monkeypatch.setattr(main.settings, "local_api_token", "test-local-token")
+    response = TestClient(main.app).post(
+        "/api/chat",
+        json={"message": "test"},
+        headers={
+            "authorization": "Bearer test-local-token",
+            "origin": "https://attacker.example",
+        },
+    )
+    assert response.status_code == 403
