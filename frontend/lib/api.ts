@@ -1,4 +1,5 @@
-const API_BASE = (process.env.NEXT_PUBLIC_API_BASE_URL || "http://127.0.0.1:8000").replace(/\/$/, "");
+// Same-origin proxy keeps the local API token on the Next.js server, not in browser JS.
+const API_BASE = (process.env.NEXT_PUBLIC_API_BASE_URL || "/api/backend").replace(/\/$/, "");
 
 export async function api<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(`${API_BASE}${path}`, {
