@@ -4,7 +4,6 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-from app.agent.schemas import TradeProposal
 from app.config import Settings
 from app.execution.paper_broker import PaperBroker
 from app.market_data.monitor import MarketMonitor
