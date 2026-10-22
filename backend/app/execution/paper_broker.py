@@ -789,14 +789,6 @@ class PaperBroker:
         if automated:
             if not self.settings.autonomous_paper_trading_enabled:
                 raise RuntimeError("Autonomous paper trading is disabled.")
-        if automated or self.settings.alpaca_paper_trading_enabled:
-            now_for_session = datetime.now(UTC)
-            if not is_regular_us_session(now_for_session):
-                raise RiskRejected("Intraday entries are allowed only during regular US market hours.")
-            session = us_session_bounds(now_for_session.astimezone(NEW_YORK).date())
-            if session and now_for_session >= session[1] - timedelta(minutes=5):
-                raise RiskRejected("New intraday entries are blocked during the final five minutes of the US session.")
-
         proposal_record = self.db.get_proposal(proposal_id)
         if proposal_record is None:
             raise KeyError("Proposal not found")
@@ -949,6 +941,18 @@ class PaperBroker:
             max_gross_exposure_pct=self.settings.max_gross_exposure_pct,
             min_reward_risk=self.settings.min_reward_risk,
         )
+
+        # Every new position is intraday-only, including manually approved local simulations.
+        # Never create a position outside the regular session or close enough to the bell that
+        # the end-of-day monitor cannot reliably flatten it.
+        now_for_session = datetime.now(UTC)
+        if not is_regular_us_session(now_for_session):
+            raise RiskRejected("Intraday entries are allowed only during regular US market hours.")
+        session = us_session_bounds(now_for_session.astimezone(NEW_YORK).date())
+        if session and now_for_session >= session[1] - timedelta(minutes=10):
+            raise RiskRejected(
+                "New intraday entries are blocked during the final ten minutes of the US session."
+            )
 
         broker_order: dict[str, Any] | None = None
         broker_order_id: str | None = None
