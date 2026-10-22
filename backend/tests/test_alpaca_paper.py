@@ -10,7 +10,6 @@ from app.execution.alpaca_paper import AlpacaPaperError, AlpacaPaperTrading, PAP
 import app.execution.paper_broker as paper_broker_module
 from app.execution.paper_broker import PaperBroker
 from app.storage import Database
-from app.storage import Database
 
 
 def _settings(tmp_path, **overrides):
