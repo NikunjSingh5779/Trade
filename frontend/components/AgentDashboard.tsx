@@ -154,6 +154,29 @@ export default function AgentDashboard() {
     } finally { setBusy(""); }
   }
 
+  async function resolveCloseNoOrder(positionId: string, symbolName: string) {
+    const confirmationKey = `close:${positionId}`;
+    if (!resolveConfirmations[confirmationKey]) {
+      setError("Confirm that you checked Alpaca Paper Orders and verified the position is still open.");
+      return;
+    }
+    setBusy(`resolve-close:${positionId}`); setNotice(""); setError("");
+    try {
+      const result = await api<{ status: string; symbol: string; note: string }>(
+        `/api/execution/closes/${positionId}/resolve-no-order`,
+        {
+          method: "POST",
+          body: JSON.stringify({ confirm_no_close_order_and_position_open: true })
+        }
+      );
+      setNotice(`${result.symbol || symbolName}: ${result.note}`);
+      setResolveConfirmations(previous => ({ ...previous, [confirmationKey]: false }));
+      await refresh();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Could not resolve the unknown broker close.");
+    } finally { setBusy(""); }
+  }
+
   const pending = proposals.filter(p => p.status === "pending");
   const latestResponse = jobs.find(
     j => j.status === "succeeded" && j.result?.text && j.task !== "market_scan"
@@ -235,6 +258,31 @@ export default function AgentDashboard() {
                 onClick={() => void resolveNoOrder(intent.proposal_id, intent.symbol)}
                 className="mt-3 rounded-lg border border-amber-700 px-3 py-2 text-xs font-semibold text-amber-100 disabled:cursor-not-allowed disabled:opacity-40"
               >{busy === `resolve:${intent.proposal_id}` ? "Checking…" : "Release after verification"}</button>
+            </div>)}
+          </div>}
+          {execution.mode === "alpaca_paper" && !!execution.unresolved_closes?.length && <div className="mt-4 space-y-3 border-t border-[#34445a] pt-3">
+            <div className="font-semibold text-amber-100">Unresolved Alpaca Paper closes</div>
+            <p className="leading-5 text-amber-100/90">A prior close request may still have reached Alpaca. Trade will not send another close while that outcome is uncertain. Wait at least 120 seconds, check Alpaca Paper Orders for a matching market close order, and confirm the position is still open before releasing it.</p>
+            {execution.unresolved_closes.map(intent => <div key={intent.position_id} className="rounded-lg border border-amber-800/70 bg-[#111827] p-3">
+              <div className="flex flex-wrap items-center justify-between gap-2"><strong>{intent.symbol} · {intent.side.toUpperCase()} · {intent.quantity} shares</strong><span className="text-[10px] uppercase tracking-wide">{intent.status.replaceAll("_", " ")}</span></div>
+              <p className="mt-1 text-[10px] text-[#9eacc0]">Close intent created: {new Date(intent.created_at).toLocaleString()}</p>
+              <label className="mt-3 flex cursor-pointer items-start gap-2 leading-5">
+                <input
+                  type="checkbox"
+                  className="mt-1"
+                  checked={Boolean(resolveConfirmations[`close:${intent.position_id}`])}
+                  onChange={event => setResolveConfirmations(previous => ({
+                    ...previous, [`close:${intent.position_id}`]: event.target.checked
+                  }))}
+                />
+                <span>I checked Alpaca Paper Orders: no matching market close order is open or filled, and Alpaca Paper still shows this position open.</span>
+              </label>
+              <button
+                type="button"
+                disabled={!resolveConfirmations[`close:${intent.position_id}`] || Boolean(busy)}
+                onClick={() => void resolveCloseNoOrder(intent.position_id, intent.symbol)}
+                className="mt-3 rounded-lg border border-amber-700 px-3 py-2 text-xs font-semibold text-amber-100 disabled:cursor-not-allowed disabled:opacity-40"
+              >{busy === `resolve-close:${intent.position_id}` ? "Checking…" : "Release close retry after verification"}</button>
             </div>)}
           </div>}
         </div>}
