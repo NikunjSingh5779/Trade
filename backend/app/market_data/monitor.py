@@ -62,22 +62,43 @@ class MarketMonitor:
             current = datetime.now(UTC)
             regular_session = is_regular_us_session(current)
             session = us_session_bounds(current.astimezone(_US_EASTERN).date())
+            closing_window = bool(
+                session and session[1] - timedelta(minutes=10) <= current < session[1]
+            )
             try:
-                # Broker-backed entries are flattened during the final five minutes so
-                # market-close orders are submitted while regular trading is still open.
+                # Prioritize exits: do not queue another model scan during the final
+                # ten minutes, and poll more frequently so a five-minute interval cannot
+                # accidentally skip the market-close window.
                 await self.close_intraday_positions_after_session(current)
-                if regular_session:
+                if regular_session and not closing_window:
                     await self.run_once()
+
+                # A scan or slow local model may have consumed time. Re-check the clock
+                # after work and perform a second close sweep if we entered the final window.
+                after_work = datetime.now(UTC)
+                session_after = us_session_bounds(
+                    after_work.astimezone(_US_EASTERN).date()
+                )
+                in_close_window = bool(
+                    session_after
+                    and session_after[1] - timedelta(minutes=10) <= after_work < session_after[1]
+                )
+                if in_close_window and is_regular_us_session(after_work):
+                    await self.close_intraday_positions_after_session(after_work)
             except Exception as exc:
                 self.db.add_audit("market_scan.failed", {"error_type": type(exc).__name__})
+
+            sleep_now = datetime.now(UTC)
+            sleep_session = us_session_bounds(sleep_now.astimezone(_US_EASTERN).date())
             near_close = bool(
-                regular_session and session
-                and current >= session[1] - timedelta(minutes=5)
+                sleep_session
+                and sleep_session[1] - timedelta(minutes=10) <= sleep_now < sleep_session[1]
             )
+            regular_now = is_regular_us_session(sleep_now)
             timeout = (
-                60
-                if not regular_session or near_close
-                else self.settings.market_scan_interval_seconds
+                30 if near_close else
+                60 if not regular_now else
+                self.settings.market_scan_interval_seconds
             )
             try:
                 await asyncio.wait_for(self._stop.wait(), timeout=timeout)
@@ -90,10 +111,11 @@ class MarketMonitor:
     async def close_intraday_positions_after_session(
         self, now: datetime | None = None
     ) -> list[dict[str, Any]]:
-        """Close overdue intraday paper positions using the last available regular-session mark.
+        """Close overdue intraday positions using verified local bars or confirmed broker fills.
 
-        The routine also catches positions left open because the app was offline at 16:00 ET.
-        It backfills completed regular-session candles before flattening any position that remains.
+        Broker-backed positions are flattened before the scheduled NYSE close. Local simulations
+        require a verified final regular-session candle, including on early-close sessions.
+        The routine also attempts to recover positions left open while the app was offline.
         """
         current = now or datetime.now(UTC)
         if current.tzinfo is None:

@@ -19,7 +19,7 @@ Existing local-simulation positions cannot be transferred to Alpaca. To preserve
 - Automated new positions are intraday-only and only allowed during regular US market hours. Swing entry requests are rejected.
 - New automated entries must pass server-side freshness, price-consistency, size, stop/target, daily-loss, position-count and exposure checks.
 - Alpaca Paper orders use an idempotent client order ID and a bracket stop/target. Alpaca remains a simulator, not real-money execution or proof of profitability.
-- The current session gate excludes weekends and out-of-hours but does not yet use Alpaca's calendar for US exchange holidays/early closes. Keep the app running during the session; no exit monitor can run while it is offline.
+- Session checks use the installed NYSE calendar package, including holidays and scheduled early closes. New approvals are blocked outside regular hours and during the final ten minutes before the scheduled close. The monitor polls every 30 seconds during the final ten minutes and targets Alpaca Paper closes five minutes before the scheduled close. Keep the app running; a local monitor cannot act while it is offline.
 - Do not commit or paste API credentials. Store separate Alpaca Paper credentials in the ignored root .env only.
 
 ## Requirements

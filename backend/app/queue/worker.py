@@ -60,6 +60,35 @@ class QueueWorker:
     def stop(self) -> None:
         self._stop.set()
 
+    def _keep_proposal_pending_for_broker_reconciliation(
+        self, proposal: dict[str, Any] | None, error: Exception, symbol: str
+    ) -> bool:
+        """Do not reject a proposal while its broker submission could have succeeded."""
+        if not proposal or not self.settings.alpaca_paper_trading_enabled:
+            return False
+        proposal_id = str(proposal.get("id") or "")
+        if not proposal_id:
+            return False
+        with self.db.connect() as conn:
+            row = conn.execute(
+                "SELECT status FROM broker_order_intents WHERE proposal_id=?",
+                (proposal_id,),
+            ).fetchone()
+        if row is None or row["status"] not in {"submitting", "unknown"}:
+            return False
+
+        reason = f"Approval/local bookkeeping failed after broker intent existed: {type(error).__name__}: {error}"
+        self.db.update_broker_order_intent(
+            proposal_id, "unknown", last_error=reason
+        )
+        self.db.add_audit("alpaca_paper.entry_bookkeeping_outcome_unknown", {
+            "proposal_id": proposal_id,
+            "symbol": symbol,
+            "error_type": type(error).__name__,
+            "reason": str(error).replace("\\n", " ")[:300],
+        })
+        return True
+
     async def _process(self, task: str, payload: dict[str, Any]) -> dict[str, Any]:
         if task == "analyze_proposal":
             timeframe = str(payload.get("timeframe", "intraday"))
@@ -254,6 +283,15 @@ class QueueWorker:
                 })
                 skipped += 1
             except (ValidationError, ValueError, TypeError, KeyError, RuntimeError) as exc:
+                reason = str(exc).replace("\\n", " ")[:300]
+                if self._keep_proposal_pending_for_broker_reconciliation(saved_proposal, exc, symbol):
+                    decision_outcomes.append({
+                        "symbol": symbol, "decision": "trade",
+                        "status": "broker_pending",
+                        "reason": "Broker outcome requires reconciliation before this proposal can be rejected or retried.",
+                    })
+                    skipped += 1
+                    continue
                 if saved_proposal is not None:
                     try:
                         self.db.reject_proposal(
@@ -261,7 +299,6 @@ class QueueWorker:
                         )
                     except (KeyError, ValueError):
                         pass
-                reason = str(exc).replace("\\n", " ")[:300]
                 self.db.add_audit("autonomous_trade.skipped", {
                     "symbol": symbol,
                     "proposal_id": saved_proposal.get("id") if saved_proposal else None,
@@ -276,6 +313,14 @@ class QueueWorker:
             except Exception as exc:
                 # Isolate failures per symbol so one malformed decision cannot prevent all
                 # other valid decisions from being risk-checked.
+                if self._keep_proposal_pending_for_broker_reconciliation(saved_proposal, exc, symbol):
+                    decision_outcomes.append({
+                        "symbol": symbol, "decision": "trade",
+                        "status": "broker_pending",
+                        "reason": "Broker outcome requires reconciliation before this proposal can be rejected or retried.",
+                    })
+                    skipped += 1
+                    continue
                 if saved_proposal is not None:
                     try:
                         self.db.reject_proposal(

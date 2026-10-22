@@ -13,7 +13,7 @@ Browser requests go through the same-origin Next.js proxy. The local bearer toke
 1. The market monitor checks weekday US regular market hours (default interval: 300 seconds).
 2. The Alpaca market-data adapter requests recent bars for the active watchlist and saves normalized observations.
 3. Automated entries and user-requested trade proposals are intraday-only and use completed five-minute candles.
-4. Open positions use durable bar checkpoints. Local-simulation positions are managed from completed OHLC candles. Alpaca-backed positions rely on Alpaca bracket stop/target orders; the monitor reconciles broker positions/fills and sends end-of-session closes through Alpaca Paper.
+4. Open positions use durable bar checkpoints. Local-simulation positions are managed from completed OHLC candles. Alpaca-backed positions rely on Alpaca bracket stop/target orders; the monitor reconciles broker positions/fills and sends end-of-session closes through Alpaca Paper. During the final ten minutes it suppresses new scans, polls every 30 seconds, and targets broker closes five minutes before the scheduled close.
 5. The queue worker claims one persistent job at a time and invokes the same agent controller. A shared lock limits model generation to one active request.
 6. The model's output is untrusted JSON. A proposal must match the requested symbol, the intraday timeframe, and a price close to the latest supplied candle before it can be saved.
 7. Risk validation sizes shares from the relevant equity source, stop distance, daily loss, exposure and open-position limits. In Alpaca mode the equity/position exposure inputs are taken from the Alpaca Paper account after reconciliation; in local mode they come from the local SQLite simulation.

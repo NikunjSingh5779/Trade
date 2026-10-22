@@ -27,6 +27,7 @@ This software is a research and simulation tool, not financial advice. New trade
 - Aggregate gross exposure cap: MAX_GROSS_EXPOSURE_PCT (default 20% of equity).
 - Maximum open paper positions: 5.
 - Daily loss guard: blocks new entries when current New York calendar day's realized and unrealized P&L reaches the configured threshold. UTC midnight is not the US trading-day boundary.
+- Every new approval is rejected outside NYSE regular trading hours and during the final ten minutes before the scheduled close, including local-only simulation approvals.
 - Stop loss and take profit are required for a proposal.
 - PAPER_INITIAL_EQUITY=100000 applies only to local simulation. In Alpaca Paper mode, account equity, cash, positions and broker marks come from the Alpaca account API.
 - These values are engineering defaults, not recommendations for real capital.
@@ -51,4 +52,4 @@ Local simulation mode writes fake fills and positions to SQLite only; they do no
 
 Alpaca Paper mode submits an equity bracket order containing a market entry, take-profit limit order and stop-loss order. The API endpoint is hard-coded to the paper host. Alpaca Paper positions are reconciled against SQLite; broker-side bracket orders are the authority for exits and manual close is routed through Alpaca Paper with a confirmed fill price. Broker entry and close requests have durable intents. If a write result is ambiguous, the app must not book a stale local mark as the broker's fill or retry a close blindly. It checks recent broker orders and positions, keeps uncertain requests visibly pending, and only permits manual release after a 120-second wait, explicit confirmation and fresh broker API checks.
 
-Alpaca Paper is still a simulation, not a live broker guarantee. It may differ from real execution due to market impact, queue position, slippage, fees, borrow availability and other factors. The session gate excludes weekends and out-of-hours but does not yet use an authoritative holiday/early-close calendar. The app cannot monitor/close positions when it is shut down. Live trading and options are not supported.
+Alpaca Paper is still a simulation, not a live broker guarantee. It may differ from real execution due to market impact, queue position, slippage, fees, borrow availability and other factors. The session gate uses the installed NYSE calendar for weekends, holidays and scheduled early closes; its schedule is package-shipped rather than fetched live, so keep the dependency updated. The monitor polls every 30 seconds during the final ten minutes and targets Alpaca Paper closes five minutes before the scheduled close. The app cannot monitor/close positions when it is shut down. Live trading and options are not supported.
