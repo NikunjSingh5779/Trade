@@ -249,12 +249,12 @@ export default function AgentDashboard() {
                       <span className="text-xs font-semibold text-[#e4ebf6]">{outcome.symbol}</span>
                       {outcome.side && <span className={`rounded px-1.5 py-0.5 text-[10px] uppercase ${outcome.side === "long" ? "bg-[#143a30] text-[#8ee9c4]" : "bg-[#3a242b] text-[#ffb0ba]"}`}>{outcome.side}</span>}
                       <span className={`rounded px-1.5 py-0.5 text-[10px] font-semibold uppercase ${outcome.status === "opened" ? "bg-[#143a30] text-[#8ee9c4]" : outcome.status === "skipped" ? "bg-amber-950/50 text-amber-200" : "bg-[#1a2637] text-[#a8b5c8]"}`}>{outcome.status === "opened" ? "Paper position opened" : outcome.status === "no_trade" ? "No trade" : outcome.status}</span>
-                      {outcome.quantity && outcome.simulated_price && <span className="text-[10px] text-[#8e9cb2]">{outcome.quantity} shares · simulated {money(outcome.simulated_price)}</span>}
+                      {outcome.quantity && outcome.simulated_price && <span className="text-[10px] text-[#8e9cb2]">{outcome.quantity} shares · {outcome.execution_mode === "alpaca_paper" ? "Alpaca Paper fill" : "local simulated fill"} {money(outcome.simulated_price)}</span>}
                     </div>
                     {outcome.reason && <p className="text-xs leading-5 text-[#8e9cb2]">{outcome.reason}</p>}
                   </div>)}
                 </div>
-                <p className="mt-3 text-[10px] leading-4 text-[#71819a]">Only entries listed as “Paper position opened” were created. AI suggestions alone are not fills. Everything shown here is simulated.</p>
+                <p className="mt-3 text-[10px] leading-4 text-[#71819a]">Only entries listed as “Paper position opened” were executed. Local simulations stay in SQLite; Alpaca Paper fills appear in the Alpaca simulated account. No live orders are sent.</p>
               </> : <p className="text-xs leading-5 text-[#8e9cb2]">{latestScanAttempt?.status === "failed" ? `The latest market scan failed: ${latestScanAttempt.error ?? "check the backend terminal for details"}` : "Waiting for a completed autonomous scan with an execution summary. The raw AI answer alone does not prove a paper trade was opened."}</p>}
             </div>}
             {latestResponse && <div className="mt-5 rounded-xl border border-[#29384d] bg-[#0a1220] p-4">
