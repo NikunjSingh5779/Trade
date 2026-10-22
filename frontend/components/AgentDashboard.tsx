@@ -144,6 +144,11 @@ export default function AgentDashboard() {
   const execution = portfolio?.execution_status;
   const brokerMode = portfolio?.mode === "alpaca_paper";
   const localOnlyPositions = portfolio?.local_simulation_positions ?? [];
+  const displayedPositionCount = brokerMode
+    ? (execution?.broker_position_count ?? portfolio?.open_positions.length ?? 0)
+    : portfolio?.mode === "alpaca_paper_disconnected"
+      ? localOnlyPositions.length
+      : (portfolio?.open_positions.length ?? 0);
 
   return (
     <main className="mx-auto min-h-screen max-w-[1500px] px-4 py-5 md:px-8 md:py-8">
@@ -188,8 +193,8 @@ export default function AgentDashboard() {
 
       <div className="mb-5 grid grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-4">
         {[
-          { label: brokerMode ? "Alpaca Paper equity" : "Local simulation equity", value: money(portfolio?.equity ?? 100000), Icon: Wallet, note: brokerMode ? "Source: Alpaca account API" : "Local SQLite only; not Alpaca" },
-          { label: brokerMode ? "Alpaca open positions" : "Local open positions", value: String(portfolio?.open_positions.length ?? 0), Icon: TrendingUp, note: `Gross exposure ${money(portfolio?.gross_exposure ?? 0)}` },
+          { label: brokerMode ? "Alpaca Paper equity" : portfolio?.mode === "alpaca_paper_disconnected" ? "Local ledger equity" : "Local simulation equity", value: portfolio ? money(portfolio.equity) : "Connecting…", Icon: Wallet, note: brokerMode ? "Source: Alpaca account API" : portfolio?.mode === "alpaca_paper_disconnected" ? "Alpaca unavailable; local figures only" : "Local SQLite only; not Alpaca" },
+          { label: brokerMode ? "Alpaca open positions" : portfolio?.mode === "alpaca_paper_disconnected" ? "Legacy local positions" : "Local open positions", value: portfolio ? String(displayedPositionCount) : "—", Icon: TrendingUp, note: `Gross exposure ${money(portfolio?.gross_exposure ?? 0)}` },
           { label: "Unrealized P&L", value: money(portfolio?.unrealized_pnl ?? 0), Icon: (portfolio?.unrealized_pnl ?? 0) >= 0 ? ArrowUpRight : ArrowDownRight, note: brokerMode ? "Alpaca-reported position P&L" : "Local simulation marks" },
           { label: "AI queue", value: String(health?.queue_depth ?? "—"), Icon: Activity, note: "Max one inference active" }
         ].map((item) => (
@@ -201,7 +206,7 @@ export default function AgentDashboard() {
         ))}
       </div>
 
-      <p className="mb-5 text-xs leading-5 text-[#8e9cb2]">Capital and risk clarification: $100,000 is the default starting equity. At 0.25% risk per trade, the initial loss budget is $250 (= $100,000 × 0.0025), not the trade size. Position size is further limited by stop distance and exposure caps. Alpaca account balances are separate from local simulation balances.</p>
+      <p className="mb-5 text-xs leading-5 text-[#8e9cb2]">Capital and risk: $100,000 is the default for local simulation and a newly created Alpaca Paper account; the actual account equity appears after a successful broker connection. At 0.25% risk per trade, $250 is the estimated stop-loss risk budget (= $100,000 × 0.0025), not the trade size. Position size is also limited by stop distance and exposure caps.</p>
 
       <div className="grid grid-cols-1 gap-5 xl:grid-cols-[minmax(0,1.2fr)_minmax(360px,.8fr)]">
         <div className="flex flex-col gap-5">
