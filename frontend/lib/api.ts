@@ -52,6 +52,7 @@ export type PortfolioPosition = {
   id: string; symbol: string; side: string; quantity: number; entry_price: number;
   current_price: number; stop_loss: number; take_profit: number; status: string;
   execution_mode?: "local_simulation" | "alpaca_paper" | string;
+  close_intent_status?: string;
   opened_at?: string; proposal_id?: string; timeframe?: string;
 };
 export type BrokerPosition = {
