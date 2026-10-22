@@ -9,7 +9,7 @@ class ChatRequest(BaseModel):
 
 class AnalyzeRequest(BaseModel):
     symbol: str = Field(min_length=1, max_length=12)
-    timeframe: Literal["intraday", "swing"] = "intraday"
+    timeframe: Literal["intraday"] = "intraday"
 
 
 class WatchlistRequest(BaseModel):
