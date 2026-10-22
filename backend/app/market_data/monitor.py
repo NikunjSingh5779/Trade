@@ -1,5 +1,5 @@
 import asyncio
-from datetime import UTC, datetime, time, timedelta
+from datetime import UTC, datetime, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -8,7 +8,7 @@ from app.config import Settings
 from app.market_data.alpaca import AlpacaMarketData
 from app.market_data.feeds import ConfiguredFeedService
 from app.market_data.freshness import MarketDataFreshnessError, ensure_fresh_bars
-from app.market_data.sessions import current_scan_window, is_regular_us_bar, is_regular_us_session
+from app.market_data.sessions import current_scan_window, is_regular_us_bar, is_regular_us_session, us_session_bounds
 from app.execution.paper_broker import AlpacaPaperError, PaperBroker
 from app.storage import Database
 
@@ -59,17 +59,21 @@ class MarketMonitor:
 
     async def run_forever(self) -> None:
         while not self._stop.is_set():
-            regular_session = is_regular_us_session()
+            current = datetime.now(UTC)
+            regular_session = is_regular_us_session(current)
+            session = us_session_bounds(current.astimezone(_US_EASTERN).date())
             try:
-                # First recover any position carried across a prior session because the
-                # app was offline; same-day positions are left untouched before 16:00 ET.
-                await self.close_intraday_positions_after_session()
+                # Broker-backed entries are flattened during the final five minutes so
+                # market-close orders are submitted while regular trading is still open.
+                await self.close_intraday_positions_after_session(current)
                 if regular_session:
                     await self.run_once()
             except Exception as exc:
                 self.db.add_audit("market_scan.failed", {"error_type": type(exc).__name__})
-            eastern_clock = datetime.now(_US_EASTERN).time().replace(tzinfo=None)
-            near_close = regular_session and eastern_clock >= time(15, 55)
+            near_close = bool(
+                regular_session and session
+                and current >= session[1] - timedelta(minutes=5)
+            )
             timeout = (
                 60
                 if not regular_session or near_close
@@ -122,22 +126,30 @@ class MarketMonitor:
                 })
                 continue
 
-            # A position opened today stays open during regular hours. Any intraday
-            # position from an earlier date is overdue and is flattened on recovery.
-            due = (
-                opened_local.date() < eastern_now.date()
-                or (
-                    eastern_now.weekday() < 5
-                    and eastern_now.time().replace(tzinfo=None) >= time(16, 0)
-                    and opened_local.date() == eastern_now.date()
+            # Broker-backed positions are closed before the scheduled session end
+            # while market orders can still fill; local simulations use the scheduled close.
+            session = us_session_bounds(eastern_now.date())
+            if opened_local.date() < eastern_now.date():
+                due = True
+            elif opened_local.date() == eastern_now.date() and session:
+                due_at = (
+                    session[1] - timedelta(minutes=5)
+                    if position.get("execution_mode") == "alpaca_paper"
+                    else session[1]
                 )
-            )
+                due = current >= due_at
+            else:
+                due = False
             if not due:
                 continue
 
             if position.get("execution_mode") == "alpaca_paper":
-                # Alpaca's attached bracket orders own stop/target exits. At/after
-                # session end close through the paper Trading API, never at a stale local mark.
+                # Never send a market close while the regular session is shut; an off-hours
+                # day order could be queued for the next session rather than flattening now.
+                if not is_regular_us_session(current):
+                    continue
+                # Alpaca's attached bracket orders own stop/target exits. Close through
+                # the paper Trading API, never at a stale local mark.
                 if self.paper_broker is None:
                     self.db.add_audit("paper_position.session_close_skipped", {
                         "position_id": position["id"], "reason": "paper_broker_not_available",
