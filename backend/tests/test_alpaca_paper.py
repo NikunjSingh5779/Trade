@@ -283,8 +283,6 @@ def test_ambiguous_alpaca_submission_is_recovered_from_client_order_id(tmp_path,
 
 
 def test_autonomous_worker_keeps_proposal_pending_after_ambiguous_broker_write(tmp_path, monkeypatch):
-    from app.agent.schemas import TradeProposal
-
     settings = _settings(
         tmp_path, autonomous_paper_trading_enabled=True,
         autonomous_trading_symbols="AAPL", watchlist_symbols="AAPL",
