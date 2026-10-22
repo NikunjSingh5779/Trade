@@ -226,6 +226,8 @@ class QueueWorker:
                     "side": proposal.side,
                     "quantity": execution["quantity"],
                     "simulated_price": execution["simulated_price"],
+                    "execution_mode": execution.get("execution_mode", "local_simulation"),
+                    "broker_order_id": execution.get("broker_order_id"),
                     "reason": str(proposal.thesis)[:240],
                 })
                 opened += 1
