@@ -1,7 +1,9 @@
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, time, timedelta
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from app.config import Settings
+from app.execution.alpaca_paper import AlpacaPaperError, AlpacaPaperTrading
 from app.market_data.freshness import (
     MarketDataFreshnessError, ensure_fresh_bars, max_age_seconds,
   )
@@ -16,6 +18,184 @@ class PaperBroker:
     def __init__(self, settings: Settings, db: Database):
         self.settings = settings
         self.db = db
+        self.alpaca = AlpacaPaperTrading(settings)
+
+    @staticmethod
+    def _client_order_id(proposal_id: str) -> str:
+        # Stable ID makes an approval retry idempotent at Alpaca as well as in SQLite.
+        return ("trade-" + "".join(ch for ch in proposal_id if ch.isalnum() or ch == "-") )[:48]
+
+    def _local_open_positions(self) -> list[dict[str, Any]]:
+        with self.db.connect() as conn:
+            return [dict(row) for row in conn.execute(
+                "SELECT * FROM positions WHERE status='open' ORDER BY opened_at DESC"
+            ).fetchall()]
+
+    def _confirmed_bracket_exit(self, position: dict[str, Any]) -> dict[str, Any] | None:
+        order = self.alpaca.order_by_client_id(self._client_order_id(str(position["proposal_id"])))
+        if not order:
+            return None
+        legs = order.get("legs")
+        if not isinstance(legs, list):
+            return None
+        filled = [leg for leg in legs if isinstance(leg, dict)
+                  and str(leg.get("status", "")).lower() == "filled"
+                  and leg.get("filled_avg_price")]
+        if not filled:
+            return None
+        filled.sort(key=lambda leg: str(leg.get("filled_at") or leg.get("updated_at") or ""))
+        return filled[-1]
+
+    def sync_broker_positions(self) -> dict[str, Any]:
+        """Reconcile locally tracked Alpaca positions to Alpaca's paper account truth."""
+        if not self.settings.alpaca_paper_trading_enabled:
+            return {"connected": False, "reconciled": True, "issues": [], "mode": "local_simulation"}
+        remote = self.alpaca.positions()
+        remote_by_symbol = {str(row.get("symbol", "")).upper(): row for row in remote}
+        local = self._local_open_positions()
+        tracked = {str(row["symbol"]).upper(): row for row in local
+                   if row.get("execution_mode") == "alpaca_paper"}
+        issues: list[str] = []
+        synchronized: list[str] = []
+        auto_closed: list[dict[str, Any]] = []
+
+        for position in local:
+            symbol = str(position["symbol"]).upper()
+            if position.get("execution_mode") != "alpaca_paper":
+                issues.append(f"{symbol}: local-only simulated position is still open")
+                continue
+            broker_position = remote_by_symbol.get(symbol)
+            if broker_position is None:
+                exit_leg = self._confirmed_bracket_exit(position)
+                if exit_leg is None:
+                    issues.append(f"{symbol}: app tracks an Alpaca position that is absent at the broker")
+                    continue
+                try:
+                    exit_price = float(exit_leg["filled_avg_price"])
+                    result = self.db.close_position(str(position["id"]), exit_price)
+                    event = {
+                        **result, "symbol": symbol,
+                        "reason": str(exit_leg.get("type") or "alpaca_bracket_exit"),
+                        "broker_order_id": exit_leg.get("id"),
+                        "mode": "alpaca_paper",
+                    }
+                    self.db.add_audit("alpaca_paper.position_reconciled_closed", event)
+                    auto_closed.append(event)
+                except (KeyError, ValueError, TypeError) as exc:
+                    issues.append(f"{symbol}: could not reconcile broker exit ({type(exc).__name__})")
+                continue
+            try:
+                remote_qty = abs(float(broker_position.get("qty", 0)))
+                local_qty = abs(float(position["quantity"]))
+                remote_side = str(broker_position.get("side", "")).lower()
+                local_side = str(position["side"]).lower()
+                if remote_side != local_side or abs(remote_qty - local_qty) > 1e-6:
+                    issues.append(f"{symbol}: share quantity/side differs between app and Alpaca")
+                    continue
+                mark = float(broker_position.get("current_price", position["current_price"]))
+                self.db.mark_position(symbol, mark)
+                synchronized.append(symbol)
+            except (TypeError, ValueError):
+                issues.append(f"{symbol}: broker position has invalid quantity or mark")
+
+        for symbol in sorted(set(remote_by_symbol) - set(tracked)):
+            issues.append(f"{symbol}: Alpaca has a position the app does not track")
+        return {
+            "connected": True,
+            "reconciled": not issues,
+            "issues": issues,
+            "broker_positions": remote,
+            "synchronized_symbols": synchronized,
+            "auto_closed": auto_closed,
+            "mode": "alpaca_paper",
+        }
+
+    def execution_status(self) -> dict[str, Any]:
+        if not self.settings.alpaca_paper_trading_enabled:
+            local = self._local_open_positions()
+            return {
+                "mode": "local_simulation", "enabled": False, "connected": False,
+                "configured": self.alpaca.configured, "reconciled": True,
+                "open_local_simulation_positions": sum(
+                    row.get("execution_mode") != "alpaca_paper" for row in local
+                ),
+                "note": "Local simulation only; its trades never appear in Alpaca.",
+            }
+        if not self.alpaca.configured:
+            return {"mode": "alpaca_paper", "enabled": True, "connected": False,
+                    "reconciled": False, "error": "Alpaca Paper API credentials are missing."}
+        try:
+            reconciliation = self.sync_broker_positions()
+            account = self.alpaca.account()
+            clean_account = {
+                key: account.get(key) for key in (
+                    "status", "currency", "equity", "last_equity", "cash", "buying_power",
+                    "portfolio_value", "trading_blocked", "account_blocked", "shorting_enabled",
+                )
+            }
+            return {
+                "mode": "alpaca_paper", "enabled": True, "connected": True,
+                "configured": True, "account": clean_account,
+                "broker_position_count": len(reconciliation.get("broker_positions", [])),
+                "reconciled": reconciliation["reconciled"],
+                "issues": reconciliation["issues"],
+                "note": "Orders use the Alpaca Paper API only; no live endpoint is supported.",
+            }
+        except AlpacaPaperError as exc:
+            return {"mode": "alpaca_paper", "enabled": True, "connected": False,
+                    "configured": True, "reconciled": False, "error": str(exc)}
+
+    def _require_reconciled_broker(self) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+        if not self.settings.alpaca_paper_trading_enabled:
+            return {}, []
+        reconciliation = self.sync_broker_positions()
+        if not reconciliation.get("reconciled"):
+            reasons = "; ".join(reconciliation.get("issues", []))
+            raise RiskRejected(
+                "Alpaca Paper execution is blocked until app and broker positions reconcile: "
+                + reasons[:500]
+            )
+        account = self.alpaca.account()
+        status = str(account.get("status", "")).upper()
+        if status != "ACTIVE" or account.get("trading_blocked") or account.get("account_blocked"):
+            raise RiskRejected("Alpaca Paper account is not active or is blocked from trading.")
+        positions = self.alpaca.positions()
+        return account, positions
+
+    def close_position(self, position_id: str, *, reason: str = "manual_close") -> dict[str, Any]:
+        with self.db.connect() as conn:
+            row = conn.execute("SELECT * FROM positions WHERE id=?", (position_id,)).fetchone()
+        if row is None:
+            raise KeyError("Position not found")
+        position = dict(row)
+        if position["status"] != "open":
+            raise ValueError("Position is already closed.")
+        if position.get("execution_mode") != "alpaca_paper":
+            result = self.db.close_position(position_id, None)
+            result["mode"] = "paper"
+            result["execution_mode"] = "local_simulation"
+            self.db.add_audit("paper_position.closed", {**result, "reason": reason})
+            return result
+        if not self.settings.alpaca_paper_trading_enabled:
+            raise RiskRejected("Alpaca Paper execution is disabled; broker-backed position was not closed.")
+        remote = {str(item.get("symbol", "")).upper(): item for item in self.alpaca.positions()}
+        if str(position["symbol"]).upper() not in remote:
+            self.sync_broker_positions()
+            raise RiskRejected(
+                "Alpaca no longer reports this position. Refresh execution status and reconcile its exit first."
+            )
+        order = self.alpaca.close_position(str(position["symbol"]))
+        try:
+            exit_price = float(order["filled_avg_price"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise AlpacaPaperError(
+                "Alpaca returned a close order without a confirmed fill price; local position remains open."
+            ) from exc
+        result = self.db.close_position(position_id, exit_price)
+        result.update({"mode": "alpaca_paper", "execution_mode": "alpaca_paper",
+                       "broker_order_id": order.get("id"), "reason": reason})
+        self.db.add_audit("alpaca_paper.position_closed", result)
+        return result
 
     def approve(
         self, proposal_id: str, version: int, *, automated: bool = False
