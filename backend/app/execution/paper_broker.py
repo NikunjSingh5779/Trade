@@ -529,7 +529,15 @@ class PaperBroker:
                     "JOIN proposals p ON p.id=i.proposal_id "
                     "WHERE i.status IN ('submitting','unknown') ORDER BY i.created_at"
                 ).fetchall()
+                unresolved_close_rows = conn.execute(
+                    "SELECT ci.position_id, ci.symbol, ci.status, ci.created_at, "
+                    "p.side, p.quantity FROM broker_close_intents ci "
+                    "JOIN positions p ON p.id=ci.position_id "
+                    "WHERE ci.status IN ('submitting','unknown') AND p.status='open' "
+                    "ORDER BY ci.created_at"
+                ).fetchall()
             unresolved_intents = [dict(row) for row in unresolved_rows]
+            unresolved_closes = [dict(row) for row in unresolved_close_rows]
             broker_positions = []
             for position in reconciliation.get("broker_positions", []):
                 broker_positions.append({
@@ -546,6 +554,7 @@ class PaperBroker:
                 "reconciled": reconciliation["reconciled"],
                 "issues": reconciliation["issues"],
                 "unresolved_intents": unresolved_intents,
+                "unresolved_closes": unresolved_closes,
                 "note": "Orders use the Alpaca Paper API only; no live endpoint is supported.",
             }
         except AlpacaPaperError as exc:
