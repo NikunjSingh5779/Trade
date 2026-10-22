@@ -307,6 +307,14 @@ export default function AgentDashboard() {
             <p className="mt-2 text-xs leading-5 text-amber-100">These positions were created through Alpaca Paper, but the broker API is currently unavailable or their current state could not be confirmed. Do not close them at a local mark. Reconnect Alpaca and confirm broker status first.</p>
             <div className="mt-4 space-y-2">{brokerOfflinePositions.map(pos => <div key={pos.id} className="rounded-lg border border-[#2b3c54] bg-[#0a1220] p-3 text-xs"><strong>{pos.symbol} · {pos.side.toUpperCase()} · {pos.quantity} shares</strong><p className="mt-1 text-[#a8b5c8]">Recorded entry {money(pos.entry_price)} · last stored mark {money(pos.current_price)} · stop {money(pos.stop_loss)} · target {money(pos.take_profit)}</p></div>)}</div>
           </Panel>}
+          {brokerMode && (portfolio?.broker_positions?.length ?? 0) > 0 && <Panel className="p-5">
+            <SectionTitle icon={Activity} title="Actual Alpaca Paper account positions" note="Broker API"/>
+            <p className="mt-2 text-xs leading-5 text-[#8e9cb2]">These rows come directly from Alpaca's Paper account. Any “broker-only” or mismatched position must be reconciled before this app can open another Alpaca Paper trade. They are never silently copied into the local ledger.</p>
+            <div className="mt-4 overflow-x-auto"><table className="w-full min-w-[500px] text-left text-xs">
+              <thead className="text-[#71819a]"><tr className="border-b border-[#263449]"><th className="pb-2">Symbol</th><th className="pb-2">Side / Qty</th><th className="pb-2">Avg entry</th><th className="pb-2">Current</th><th className="pb-2">Unrealized P&amp;L</th></tr></thead>
+              <tbody>{(portfolio?.broker_positions ?? []).map((bp, index) => <tr key={`${bp.symbol}-${index}`} className="border-b border-[#1f2b3d] last:border-0"><td className="py-2 font-semibold">{bp.symbol}</td><td className="py-2 capitalize">{bp.side ?? "—"} / {bp.qty ?? "—"}</td><td className="py-2">{bp.avg_entry_price ? money(Number(bp.avg_entry_price)) : "—"}</td><td className="py-2">{bp.current_price ? money(Number(bp.current_price)) : "—"}</td><td className="py-2">{bp.unrealized_pl ? money(Number(bp.unrealized_pl)) : "$0.00"}</td></tr>)}</tbody>
+            </table></div>
+          </Panel>}
           {localOnlyPositions.length > 0 && <Panel className="p-5">
             <SectionTitle icon={CircleAlert} title="Legacy local-only positions" note="Not in Alpaca"/>
             <p className="mt-2 text-xs leading-5 text-amber-100">These rows are local simulations from before Alpaca Paper routing was enabled. They are not broker holdings and are excluded from Alpaca equity/P&L. Review each before using “Close at mark”; that closes only the local simulation.</p>
