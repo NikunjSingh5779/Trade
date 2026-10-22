@@ -606,23 +606,64 @@ class PaperBroker:
                 "the position remains broker-protected and has not been locally closed."
             )
         remote = {str(item.get("symbol", "")).upper(): item for item in self.alpaca.positions()}
-        if str(position["symbol"]).upper() not in remote:
+        symbol = str(position["symbol"]).upper()
+        if symbol not in remote:
             self.sync_broker_positions()
             raise RiskRejected(
                 "Alpaca no longer reports this position. Refresh execution status and reconcile its exit first."
             )
-        order = self.alpaca.close_position(str(position["symbol"]))
+
+        # Persist a close intent before DELETE /positions. If the response is lost,
+        # another click must not send a second liquidation request.
+        self.db.register_broker_close_intent(position_id, symbol)
+        try:
+            order = self.alpaca.close_position(symbol)
+        except AlpacaOrderOutcomeUnknown as exc:
+            self.db.update_broker_close_intent(
+                position_id, "unknown", last_error=str(exc)
+            )
+            self.db.add_audit("alpaca_paper.close_outcome_unknown", {
+                "position_id": position_id, "symbol": symbol,
+                "error_type": type(exc).__name__, "reason": str(exc)[:300],
+            })
+            raise
+        except AlpacaOrderRejected as exc:
+            self.db.update_broker_close_intent(
+                position_id, "failed", last_error=str(exc)
+            )
+            raise
+        except AlpacaPaperError as exc:
+            self.db.update_broker_close_intent(
+                position_id, "failed", last_error=str(exc)
+            )
+            raise
+
         try:
             exit_price = float(order["filled_avg_price"])
+            broker_order_id = str(order["id"])
+            if exit_price <= 0 or not broker_order_id:
+                raise ValueError("invalid fill")
         except (KeyError, TypeError, ValueError) as exc:
-            raise AlpacaPaperError(
-                "Alpaca returned a close order without a confirmed fill price; local position remains open."
+            self.db.update_broker_close_intent(
+                position_id, "unknown",
+                broker_order_id=str(order.get("id") or ""),
+                last_error="Alpaca close response omitted a valid confirmed fill price/order ID.",
+            )
+            raise AlpacaOrderOutcomeUnknown(
+                "Alpaca close may have executed but did not return a valid confirmed fill. "
+                "Do not retry; reconcile the Paper Orders list first."
             ) from exc
+
         result = self.db.close_position(
             position_id, exit_price, pricing_method_override="alpaca_paper_broker_fill"
         )
-        result.update({"mode": "alpaca_paper", "execution_mode": "alpaca_paper",
-                       "broker_order_id": order.get("id"), "reason": reason})
+        result.update({
+            "mode": "alpaca_paper", "execution_mode": "alpaca_paper",
+            "broker_order_id": broker_order_id, "reason": reason,
+        })
+        self.db.update_broker_close_intent(
+            position_id, "recorded", broker_order_id=broker_order_id
+        )
         self.db.add_audit("alpaca_paper.position_closed", result)
         return result
 
