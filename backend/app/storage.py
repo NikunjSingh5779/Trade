@@ -66,7 +66,8 @@ class Database:
                     status TEXT NOT NULL, opened_at TEXT NOT NULL, closed_at TEXT,
                     realized_pnl REAL NOT NULL DEFAULT 0,
                     timeframe TEXT NOT NULL DEFAULT 'intraday',
-                    last_processed_bar_at TEXT
+                    last_processed_bar_at TEXT,
+                    execution_mode TEXT NOT NULL DEFAULT 'local_simulation'
                 );
                 CREATE INDEX IF NOT EXISTS ix_positions_status ON positions(status);
                 CREATE TABLE IF NOT EXISTS watchlist (
@@ -101,6 +102,10 @@ class Database:
             if "last_processed_bar_at" not in position_columns:
                 conn.execute(
                     "ALTER TABLE positions ADD COLUMN last_processed_bar_at TEXT"
+                )
+            if "execution_mode" not in position_columns:
+                conn.execute(
+                    "ALTER TABLE positions ADD COLUMN execution_mode TEXT NOT NULL DEFAULT 'local_simulation'"
                 )
             legacy_positions = conn.execute(
                 "SELECT p.id, pr.body_json FROM positions p "
@@ -369,7 +374,8 @@ class Database:
     def approve_paper_trade(
         self, proposal_id: str, version: int, quantity: int, max_open_positions: int,
         max_exposure_value: float, *, simulated_fill_price: float | None = None,
-        slippage_bps: float = 0.0,
+        slippage_bps: float = 0.0, execution_mode: str = "local_simulation",
+        broker_order_id: str | None = None,
     ) -> dict[str, Any]:
         now = utc_now()
         with self.connect() as conn:
@@ -405,14 +411,27 @@ class Database:
                 conn.rollback()
                 raise ValueError("Exposure limit would be exceeded.")
             order_id, position_id = new_id("ord"), new_id("pos")
+            if execution_mode not in {"local_simulation", "alpaca_paper"}:
+                conn.rollback()
+                raise ValueError("Unsupported paper execution mode.")
             details = {
                 "proposal_id": proposal_id,
                 "proposal_version": version,
                 "requested_entry_price": float(body["entry_price"]),
-                "simulated_fill_price": fill_price,
-                "fill_source": "latest_server_stored_bar_close_with_adverse_slippage",
+                "fill_price": fill_price,
+                "execution_mode": execution_mode,
+                "broker_order_id": broker_order_id,
+                "fill_source": (
+                    "alpaca_paper_broker_confirmed_fill"
+                    if execution_mode == "alpaca_paper"
+                    else "latest_server_stored_bar_close_with_adverse_slippage"
+                ),
                 "slippage_bps": float(slippage_bps),
-                "note": "Paper-only fill simulation; not a real market or broker fill.",
+                "note": (
+                    "Alpaca Paper Trading simulated brokerage fill."
+                    if execution_mode == "alpaca_paper"
+                    else "Local paper simulation; not a broker order or fill."
+                ),
             }
             conn.execute(
                 "INSERT INTO orders(id,proposal_id,symbol,side,quantity,status,simulated_price,created_at,details_json) "
@@ -422,11 +441,11 @@ class Database:
             )
             conn.execute(
                 "INSERT INTO positions(id,proposal_id,symbol,side,quantity,entry_price,current_price,"
-                "stop_loss,take_profit,status,opened_at,timeframe) "
-                "VALUES (?,?,?,?,?,?,?,?,?,'open',?,?)",
+                "stop_loss,take_profit,status,opened_at,timeframe,execution_mode) "
+                "VALUES (?,?,?,?,?,?,?,?,?,'open',?,?,?)",
                 (position_id, proposal_id, body["symbol"], body["side"], quantity,
                  fill_price, fill_price, body["stop_loss"], body["take_profit"], now,
-                 body.get("timeframe", "intraday")),
+                 body.get("timeframe", "intraday"), execution_mode),
             )
             conn.execute(
                 "UPDATE proposals SET status='approved',updated_at=? WHERE id=?",
@@ -434,7 +453,10 @@ class Database:
             )
             conn.commit()
             return {"order_id": order_id, "position_id": position_id, "status": "filled",
-                    "mode": "paper", "quantity": quantity, "simulated_price": fill_price,
+                    "mode": "alpaca_paper" if execution_mode == "alpaca_paper" else "paper",
+                    "execution_mode": execution_mode, "quantity": quantity,
+                    "simulated_price": fill_price, "fill_price": fill_price,
+                    "broker_order_id": broker_order_id,
                     "requested_entry_price": float(body["entry_price"]),
                     "slippage_bps": float(slippage_bps)}
 
