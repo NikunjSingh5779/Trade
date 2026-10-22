@@ -6,10 +6,13 @@ import respx
 from pydantic import ValidationError
 
 from app.config import Settings
-from app.execution.alpaca_paper import AlpacaPaperError, AlpacaPaperTrading, PAPER_BASE_URL
+from app.execution.alpaca_paper import (
+    AlpacaOrderOutcomeUnknown, AlpacaPaperError, AlpacaPaperTrading, PAPER_BASE_URL,
+)
 import app.execution.paper_broker as paper_broker_module
 from app.execution.paper_broker import PaperBroker
 from app.storage import Database
+from app.queue.worker import QueueWorker
 
 
 def _settings(tmp_path, **overrides):
@@ -195,3 +198,131 @@ def test_broker_approval_records_confirmed_fill_and_close_uses_broker_fill(tmp_p
                            (position["id"],)).fetchone()
     assert row["status"] == "closed"
     assert row["current_price"] == pytest.approx(100.40)
+
+
+
+def _proposal_body(timestamp):
+    return {
+        "symbol": "AAPL", "side": "long", "entry_price": 100.0, "stop_loss": 98.0,
+        "take_profit": 104.0, "thesis": "Intraday trend setup from the latest five-minute bars.",
+        "evidence": ["latest completed close: 100"], "strategy_id": "test",
+        "timeframe": "intraday", "data_asof": timestamp,
+        "data_timeframe": "intraday", "data_source": "test",
+    }
+
+
+def test_ambiguous_alpaca_submission_is_recovered_from_client_order_id(tmp_path, monkeypatch):
+    settings = _settings(tmp_path)
+    db = Database(settings.database_path)
+    db.initialize(["AAPL"])
+    now = datetime.now(UTC)
+    bars = [{
+        "symbol": "AAPL", "timestamp": (now - timedelta(minutes=6 + 5 * (11 - i))).isoformat(),
+        "open": 100.0, "high": 100.5, "low": 99.5, "close": 100.0, "volume": 10000,
+    } for i in range(12)]
+    db.save_bars(bars, source="test", timeframe="5Min")
+    proposal = db.add_proposal(_proposal_body(now.isoformat()))
+    broker = PaperBroker(settings, db)
+    monkeypatch.setattr(paper_broker_module, "is_regular_us_session", lambda now=None: True)
+    monkeypatch.setattr(
+        paper_broker_module, "us_session_bounds",
+        lambda session_day: (datetime.now(UTC) - timedelta(hours=1),
+                              datetime.now(UTC) + timedelta(hours=1)),
+    )
+    monkeypatch.setattr(
+        broker, "_require_reconciled_broker",
+        lambda: ({"status": "ACTIVE", "equity": "100000"}, []),
+    )
+    intent = {}
+
+    def uncertain_submit(**kwargs):
+        intent.update(kwargs)
+        raise AlpacaOrderOutcomeUnknown("test timeout after order submission")
+
+    monkeypatch.setattr(broker.alpaca, "submit_bracket", uncertain_submit)
+    with pytest.raises(AlpacaOrderOutcomeUnknown):
+        broker.approve(proposal["id"], proposal["version"])
+
+    assert db.get_proposal(proposal["id"])["status"] == "pending"
+    with db.connect() as conn:
+        saved_intent = dict(conn.execute(
+            "SELECT * FROM broker_order_intents WHERE proposal_id=?", (proposal["id"],)
+        ).fetchone())
+    assert saved_intent["status"] == "unknown"
+    assert saved_intent["client_order_id"] == intent["client_order_id"]
+
+    quantity = intent["quantity"]
+    remote_position = {
+        "symbol": "AAPL", "qty": str(quantity), "side": "long",
+        "current_price": "100.20", "market_value": str(quantity * 100.20),
+        "unrealized_pl": str(quantity * 0.12),
+    }
+    monkeypatch.setattr(broker.alpaca, "positions", lambda: [remote_position])
+    monkeypatch.setattr(broker.alpaca, "order_by_client_id", lambda client_id: {
+        "id": "entry-order-recovered", "status": "filled", "qty": str(quantity),
+        "filled_qty": str(quantity), "filled_avg_price": "100.08",
+        "client_order_id": intent["client_order_id"],
+    })
+
+    status = broker.sync_broker_positions()
+
+    assert status["reconciled"] is True
+    assert status["recovered_entries"][0]["symbol"] == "AAPL"
+    assert db.get_proposal(proposal["id"])["status"] == "approved"
+    with db.connect() as conn:
+        position = dict(conn.execute(
+            "SELECT * FROM positions WHERE proposal_id=?", (proposal["id"],)
+        ).fetchone())
+        saved_intent = dict(conn.execute(
+            "SELECT * FROM broker_order_intents WHERE proposal_id=?", (proposal["id"],)
+        ).fetchone())
+    assert position["execution_mode"] == "alpaca_paper"
+    assert position["quantity"] == quantity
+    assert position["entry_price"] == pytest.approx(100.08)
+    assert saved_intent["status"] == "recovered"
+
+
+def test_autonomous_worker_keeps_proposal_pending_after_ambiguous_broker_write(tmp_path, monkeypatch):
+    from app.agent.schemas import TradeProposal
+
+    settings = _settings(
+        tmp_path, autonomous_paper_trading_enabled=True,
+        autonomous_trading_symbols="AAPL", watchlist_symbols="AAPL",
+    )
+    db = Database(settings.database_path)
+    db.initialize(["AAPL"])
+    now = datetime.now(UTC)
+    bars = [{
+        "symbol": "AAPL",
+        "timestamp": (now - timedelta(minutes=6 + 5 * (11 - i))).isoformat(),
+        "open": 100.0, "high": 100.5, "low": 99.5, "close": 100.0, "volume": 1000,
+    } for i in range(12)]
+    db.save_bars(bars, source="test", timeframe="5Min")
+    broker = PaperBroker(settings, db)
+    monkeypatch.setattr(
+        broker, "approve",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AlpacaOrderOutcomeUnknown("paper broker response timed out")
+        ),
+    )
+
+    class StubAgent:
+        async def run(self, task, payload):
+            return {"task": task, "text": "", "provider": {}}
+
+    worker = QueueWorker(db, StubAgent(), settings=settings, paper_broker=broker)
+    decision = {
+        "symbol": "AAPL", "decision": "trade", "side": "long",
+        "entry_price": 100.0, "stop_loss": 98.0, "take_profit": 104.0,
+        "thesis": "Completed five-minute candles support this intraday test setup.",
+        "evidence": ["latest close 100"], "strategy_id": "test",
+    }
+    result = {"structured": {"decisions": [decision]}}
+    worker._execute_autonomous_scan(result, {
+        "symbols": ["AAPL"], "bars_by_symbol": {"AAPL": bars},
+    })
+
+    pending = db.list_proposals()
+    assert len(pending) == 1
+    assert pending[0]["status"] == "pending"
+    assert result["autonomous_trading"]["decision_outcomes"][0]["status"] == "broker_pending"
