@@ -16,7 +16,8 @@ from fastapi.responses import JSONResponse
 from app.agent.controller import AgentController
 from app.agent.schemas import (
     AnalyzeRequest, ApprovalRequest, ChatRequest, ClosePositionRequest,
-    RejectRequest, ResearchRequest, ResolveBrokerIntentRequest, UpdateStopsRequest, WatchlistRequest,
+    RejectRequest, ResearchRequest, ResolveBrokerCloseRequest, ResolveBrokerIntentRequest,
+    UpdateStopsRequest, WatchlistRequest,
 )
 from app.agent.tools import summarize_bars
 from app.config import get_settings
@@ -305,6 +306,22 @@ async def resolve_broker_intent(
         return paper_broker.resolve_unknown_order_intent(
             proposal_id,
             confirmed_no_order_and_no_position=request.confirm_no_order_and_no_position,
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except (ValueError, RuntimeError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.post("/api/execution/closes/{position_id}/resolve-no-order")
+async def resolve_broker_close_intent(
+    position_id: str, request: ResolveBrokerCloseRequest
+) -> dict[str, Any]:
+    """Release a stale close intent only after confirming no close order exists and position remains open."""
+    try:
+        return paper_broker.resolve_unknown_close_intent(
+            position_id,
+            confirmed_no_close_order_and_position_open=request.confirm_no_close_order_and_position_open,
         )
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
