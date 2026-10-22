@@ -24,6 +24,12 @@ class Settings(BaseSettings):
     live_trading_enabled: bool = False
     allow_live_order_endpoints: bool = False
 
+    # The Trading API adapter is hard-wired to https://paper-api.alpaca.markets.
+    # It has no live-endpoint configuration option and remains opt-in.
+    alpaca_paper_trading_enabled: bool = False
+    alpaca_paper_api_key: str = ""
+    alpaca_paper_api_secret: str = ""
+
     local_model_discovery_enabled: bool = True
     local_model_base_urls: str = (
         "http://127.0.0.1:8080/v1,"
@@ -113,6 +119,11 @@ class Settings(BaseSettings):
             raise ValueError(
                 "This build is paper-only: PAPER_TRADING_ONLY=true, "
                 "LIVE_TRADING_ENABLED=false, ALLOW_LIVE_ORDER_ENDPOINTS=false are mandatory."
+            )
+        if self.alpaca_paper_trading_enabled and not (self.alpaca_paper_api_key.strip() and self.alpaca_paper_api_secret.strip()):
+            raise ValueError(
+                "Alpaca Paper execution requires ALPACA_PAPER_API_KEY and "
+                "ALPACA_PAPER_API_SECRET. Live trading endpoints are not supported."
             )
         if self.auto_promote_strategies:
             raise ValueError("Automatic strategy promotion is not supported in Phase 1.")
