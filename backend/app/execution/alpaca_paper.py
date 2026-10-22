@@ -21,6 +21,10 @@ class AlpacaPaperError(RuntimeError):
     """An error returned by the Alpaca paper Trading API."""
 
 
+class AlpacaOrderOutcomeUnknown(AlpacaPaperError):
+    """A write may have reached Alpaca but its final outcome was not confirmed."""
+
+
 class AlpacaPaperTrading:
     def __init__(self, settings: Settings):
         self.settings = settings
@@ -56,12 +60,17 @@ class AlpacaPaperTrading:
                     params=params, json=payload,
                 )
         except httpx.HTTPError as exc:
-            raise AlpacaPaperError(
-                f"Alpaca Paper API connection failed ({type(exc).__name__})."
-            ) from exc
+            error = f"Alpaca Paper API connection failed ({type(exc).__name__})."
+            exception = AlpacaOrderOutcomeUnknown if method.upper() in {"POST", "DELETE"} else AlpacaPaperError
+            raise exception(error) from exc
         if missing_ok and response.status_code == 404:
             return None
         if response.is_error:
+            if method.upper() in {"POST", "DELETE"} and response.status_code >= 500:
+                raise AlpacaOrderOutcomeUnknown(
+                    f"Alpaca Paper returned HTTP {response.status_code} to a write request; "
+                    "the result may be ambiguous. Reconcile by client order ID before retrying."
+                )
             try:
                 body = response.json()
                 detail = body.get("message") or body.get("code") or "request rejected"
@@ -110,7 +119,10 @@ class AlpacaPaperTrading:
     def _wait_for_fill(self, order: dict[str, Any], attempts: int = 8) -> dict[str, Any]:
         order_id = str(order.get("id", "")).strip()
         if not order_id:
-            raise AlpacaPaperError("Alpaca Paper accepted an order without an order ID.")
+            raise AlpacaOrderOutcomeUnknown(
+                "Alpaca Paper may have accepted the order but returned no order ID. "
+                "Reconcile by client order ID before retrying."
+            )
         latest = order
         for attempt in range(attempts):
             status = str(latest.get("status", "")).lower()
@@ -126,9 +138,9 @@ class AlpacaPaperTrading:
                 raise AlpacaPaperError(f"Alpaca Paper order did not fill: {str(message)[:200]}.")
             time.sleep(0.5)
             latest = self.order_by_id(order_id)
-        raise AlpacaPaperError(
-            "Alpaca Paper order is not confirmed filled yet. Do not retry manually; "
-            "the app will reuse its client order ID to avoid creating a duplicate."
+        raise AlpacaOrderOutcomeUnknown(
+            f"Alpaca Paper order {order_id} is not confirmed filled yet. Do not submit a new order; "
+            "the app will reconcile this client order ID before allowing another entry."
         )
 
     @staticmethod
@@ -180,5 +192,8 @@ class AlpacaPaperTrading:
             raise AlpacaPaperError("Alpaca Paper close request returned no order.")
         order_id = str(response.get("id", ""))
         if not order_id:
-            raise AlpacaPaperError("Alpaca Paper close order has no order ID.")
+            raise AlpacaOrderOutcomeUnknown(
+                "Alpaca may have accepted the close order but returned no order ID; "
+                "reconcile the account before trying to close again."
+            )
         return self._wait_for_fill(response)
