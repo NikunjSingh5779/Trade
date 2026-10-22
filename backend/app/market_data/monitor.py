@@ -172,6 +172,7 @@ class MarketMonitor:
                 continue
 
             checkpoint = position.get("last_processed_bar_at") or position["opened_at"]
+            final_bars: list[dict[str, Any]] = []
             try:
                 start_time = datetime.fromisoformat(str(checkpoint).replace("Z", "+00:00"))
                 if start_time.tzinfo is None:
@@ -190,42 +191,94 @@ class MarketMonitor:
                 for bar in final_bars:
                     if not is_completed_market_bar(bar, "intraday", current):
                         continue
-                    try:
-                        stamp = datetime.fromisoformat(
-                            str(bar["timestamp"]).replace("Z", "+00:00")
-                        )
-                    except (KeyError, TypeError, ValueError):
-                        continue
-                    if stamp.tzinfo is None:
-                        stamp = stamp.replace(tzinfo=UTC)
                     if not is_regular_us_bar(bar):
                         continue
                     for event in self.db.process_position_bar(bar, timeframe="intraday"):
                         self.db.add_audit("paper_position.auto_exit", event)
             except Exception as exc:
-                # Still flatten overdue paper positions with the last server-recorded mark;
-                # the audit trail makes any failed final-bar refresh explicit.
                 self.db.add_audit("paper_position.session_close_mark_refresh_failed", {
                     "position_id": position["id"],
                     "symbol": position["symbol"],
                     "error_type": type(exc).__name__,
                 })
 
+            # A local simulation must not book an old mark as though it were the
+            # session-close fill. Accept only an actual final five-minute candle
+            # (timestamped 5 min before the official NYSE close), from Alpaca data.
             try:
-                result = self.db.close_position(position["id"], None)
+                stored_bars = self.db.get_bars(
+                    position["symbol"], limit=500, timeframe="5Min"
+                )
+                candidates = sorted(
+                    [*stored_bars, *final_bars],
+                    key=lambda bar: str(bar.get("timestamp", "")),
+                )
+                verified_close_bar: dict[str, Any] | None = None
+                verified_close_stamp: datetime | None = None
+                for bar in candidates:
+                    if not is_completed_market_bar(bar, "intraday", current):
+                        continue
+                    if not is_regular_us_bar(bar):
+                        continue
+                    try:
+                        stamp = datetime.fromisoformat(
+                            str(bar["timestamp"]).replace("Z", "+00:00")
+                        )
+                        if stamp.tzinfo is None:
+                            stamp = stamp.replace(tzinfo=UTC)
+                        stamp = stamp.astimezone(UTC)
+                        bounds = us_session_bounds(stamp.astimezone(_US_EASTERN).date())
+                        close_price = float(bar["close"])
+                    except (KeyError, TypeError, ValueError):
+                        continue
+                    if (
+                        bounds is None
+                        or stamp < bounds[1] - timedelta(minutes=5)
+                        or stamp >= bounds[1]
+                        or close_price <= 0
+                    ):
+                        continue
+                    if verified_close_stamp is None or stamp > verified_close_stamp:
+                        verified_close_bar = bar
+                        verified_close_stamp = stamp
+
+                with self.db.connect() as conn:
+                    state = conn.execute(
+                        "SELECT status FROM positions WHERE id=?", (position["id"],)
+                    ).fetchone()
+                if state is None or state["status"] != "open":
+                    # Stop/target already closed the position while processing candles.
+                    continue
+                if verified_close_bar is None:
+                    self.db.add_audit("paper_position.session_close_skipped", {
+                        "position_id": position["id"],
+                        "symbol": position["symbol"],
+                        "reason": "verified_final_regular_session_candle_unavailable",
+                    })
+                    continue
+
+                final_close_price = float(verified_close_bar["close"])
+                result = self.db.close_position(
+                    position["id"], final_close_price,
+                    pricing_method_override="last_verified_regular_session_close",
+                )
                 event = {
                     **result,
                     "symbol": position["symbol"],
                     "reason": "us_regular_session_close",
-                    "mark_source": result.get("pricing_method"),
+                    "mark_source": "alpaca_completed_final_five_minute_candle",
+                    "final_bar_timestamp": verified_close_bar["timestamp"],
                     "closed_at_check": current.isoformat(),
                     "mode": "paper",
                 }
                 self.db.add_audit("paper_position.session_close", event)
                 closed.append(event)
-            except (KeyError, ValueError) as exc:
+            except Exception as exc:
                 self.db.add_audit("paper_position.session_close_skipped", {
-                    "position_id": position["id"], "error_type": type(exc).__name__,
+                    "position_id": position["id"],
+                    "symbol": position["symbol"],
+                    "reason": "session_close_mark_not_verified",
+                    "error_type": type(exc).__name__,
                 })
         return closed
 
