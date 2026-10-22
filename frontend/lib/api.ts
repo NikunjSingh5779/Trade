@@ -69,6 +69,10 @@ export type ExecutionStatus = {
   };
   broker_position_count?: number;
   broker_positions?: BrokerPosition[];
+  unresolved_intents?: Array<{
+    proposal_id: string; symbol: string; status: string;
+    created_at: string; proposal_status: string;
+  }>;
 };
 export type Portfolio = {
   mode: string; initial_equity?: number; equity: number; cash_estimate: number;
