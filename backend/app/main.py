@@ -312,7 +312,14 @@ async def portfolio() -> dict[str, Any]:
         return {
             **local, "mode": "alpaca_paper_disconnected",
             "execution_status": execution,
-            "local_simulation_positions": local["open_positions"],
+            "local_simulation_positions": [
+                row for row in local["open_positions"]
+                if row.get("execution_mode") != "alpaca_paper"
+            ],
+            "broker_backed_positions_pending_reconciliation": [
+                row for row in local["open_positions"]
+                if row.get("execution_mode") == "alpaca_paper"
+            ],
             "open_positions": [],
             "broker_positions": execution.get("broker_positions", []),
         }
