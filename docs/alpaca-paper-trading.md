@@ -39,7 +39,7 @@ Positions created before broker mode was enabled are marked local_simulation by 
 
 Using Close at mark on a legacy local-only position closes only its SQLite simulation at the recorded mark. It does not place an Alpaca order. Do this only when you decide the fake local position should be removed. When local-only positions are still open, or Alpaca has holdings the local database does not track, the application blocks new Alpaca entries so it cannot silently mix different account states.
 
-An Alpaca-backed position is different: the app sends a close through Alpaca Paper and records the confirmed broker fill. Its stop and target are Alpaca bracket-order legs; edit those from Alpaca's Paper dashboard. If broker status is unavailable or reconciliation is not matched, stop opening new trades and investigate before retrying orders.
+An Alpaca-backed position is different: the app sends a close through Alpaca Paper and records the confirmed broker fill. Its stop and target are Alpaca bracket-order legs; edit those from Alpaca's Paper dashboard. If a close request times out, the app stores a durable close intent and will not send a second close automatically. After at least 120 seconds, check the Alpaca Paper Orders page and Positions page. The dashboard only exposes a retry-release control after you explicitly confirm there is no matching close order and the broker position remains open; it also re-checks both conditions through the Paper API. If broker status is unavailable or reconciliation is not matched, stop opening new trades and investigate before retrying orders.
 
 ## Intraday policy
 
