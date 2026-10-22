@@ -364,6 +364,10 @@ async def portfolio() -> dict[str, Any]:
         str(row.get("symbol", "")).upper(): row
         for row in execution.get("broker_positions", [])
     }
+    unresolved_closes_by_id = {
+        str(row["position_id"]): str(row["status"])
+        for row in execution.get("unresolved_closes", [])
+    }
     tracked_broker_positions = []
     for row in broker_local:
         broker_row = broker_by_symbol.get(str(row.get("symbol", "")).upper(), {})
@@ -371,6 +375,7 @@ async def portfolio() -> dict[str, Any]:
             **row,
             "current_price": float(broker_row.get("current_price") or row["current_price"]),
             "execution_mode": "alpaca_paper",
+            "close_intent_status": unresolved_closes_by_id.get(str(row["id"])),
         })
     account = execution["account"]
     broker_positions = execution.get("broker_positions", [])
