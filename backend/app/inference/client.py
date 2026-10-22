@@ -4,8 +4,19 @@ import httpx
 
 
 class OpenAICompatibleClient:
-    def __init__(self, timeout_seconds: float = 180):
+    def __init__(
+        self,
+        timeout_seconds: float = 300,
+        max_output_tokens: int = 8192,
+        reasoning_budget_tokens: int = 4096,
+    ):
+        if max_output_tokens < 1024:
+            raise ValueError("max_output_tokens must be at least 1024.")
+        if reasoning_budget_tokens < 0 or reasoning_budget_tokens >= max_output_tokens:
+            raise ValueError("reasoning_budget_tokens must leave room for the final answer.")
         self.timeout_seconds = timeout_seconds
+        self.max_output_tokens = max_output_tokens
+        self.reasoning_budget_tokens = reasoning_budget_tokens
 
     async def complete(
         self, base_url: str, model_id: str, messages: list[dict[str, str]], api_key: str = ""
@@ -17,10 +28,10 @@ class OpenAICompatibleClient:
             "model": model_id,
             "messages": messages,
             "temperature": 0.2,
-            # Reasoning-capable local models can use part of the generation budget
-            # before emitting their final answer. Keep enough room for the requested
-            # JSON/result while still relying on the configured HTTP timeout.
-            "max_tokens": 4096,
+            # Reasoning and final text share this output ceiling. A separate hard
+            # reasoning cap prevents long analysis from consuming the full answer budget.
+            "max_tokens": self.max_output_tokens,
+            "reasoning_budget_tokens": self.reasoning_budget_tokens,
         }
         async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
             response = await client.post(
