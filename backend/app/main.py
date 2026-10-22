@@ -42,8 +42,8 @@ worker = QueueWorker(
 )
 market_provider = AlpacaMarketData(settings)
 feed_service = ConfiguredFeedService(settings)
-monitor = MarketMonitor(settings, db, market_provider, feed_service)
 paper_broker = PaperBroker(settings, db)
+monitor = MarketMonitor(settings, db, market_provider, feed_service, paper_broker=paper_broker)
 
 
 @asynccontextmanager
