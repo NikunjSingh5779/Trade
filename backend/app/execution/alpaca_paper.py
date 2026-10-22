@@ -157,7 +157,6 @@ class AlpacaPaperTrading:
                 "client_order_id": client_order_id,
                 "take_profit": {"limit_price": self._price(float(take_profit))},
                 "stop_loss": {"stop_price": self._price(float(stop_loss))},
-                "extended_hours": False,
             })
         else:
             # Re-use an order after a timeout/restart; never submit a duplicate entry.
