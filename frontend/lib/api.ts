@@ -75,6 +75,7 @@ export type Portfolio = {
   gross_exposure: number; unrealized_pnl: number; realized_pnl: number | null;
   open_positions: PortfolioPosition[];
   local_simulation_positions?: PortfolioPosition[];
+  broker_backed_positions_pending_reconciliation?: PortfolioPosition[];
   broker_positions?: BrokerPosition[];
   execution_status?: ExecutionStatus;
   account_equity_source?: string; local_simulation_pnl_is_separate?: boolean;
