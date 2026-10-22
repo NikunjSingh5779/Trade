@@ -78,6 +78,13 @@ class Database:
                 );
                 CREATE INDEX IF NOT EXISTS ix_broker_order_intents_status
                     ON broker_order_intents(status, updated_at);
+                CREATE TABLE IF NOT EXISTS broker_close_intents (
+                    position_id TEXT PRIMARY KEY, symbol TEXT NOT NULL,
+                    status TEXT NOT NULL, broker_order_id TEXT, last_error TEXT,
+                    created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS ix_broker_close_intents_status
+                    ON broker_close_intents(status, updated_at);
                 CREATE TABLE IF NOT EXISTS watchlist (
                     symbol TEXT PRIMARY KEY, enabled INTEGER NOT NULL DEFAULT 1,
                     created_at TEXT NOT NULL
@@ -530,6 +537,73 @@ class Database:
                 "WHERE proposal_id=?",
                 (status, broker_order_id, last_error[:500] if last_error else None,
                  utc_now(), proposal_id),
+            )
+
+    def register_broker_close_intent(self, position_id: str, symbol: str) -> dict[str, Any]:
+        """Persist a close intent before a DELETE /positions request."""
+        now = utc_now()
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            position = conn.execute(
+                "SELECT status,execution_mode,symbol FROM positions WHERE id=?", (position_id,)
+            ).fetchone()
+            if position is None:
+                conn.rollback()
+                raise KeyError("Position not found.")
+            if position["status"] != "open" or position["execution_mode"] != "alpaca_paper":
+                conn.rollback()
+                raise ValueError("Only an open Alpaca Paper position can create a broker close intent.")
+            if str(position["symbol"]).upper() != symbol.upper():
+                conn.rollback()
+                raise ValueError("Close-intent symbol does not match the local broker position.")
+            existing = conn.execute(
+                "SELECT * FROM broker_close_intents WHERE position_id=?", (position_id,)
+            ).fetchone()
+            if existing is not None:
+                if existing["status"] in {"submitting", "unknown"}:
+                    conn.rollback()
+                    raise ValueError(
+                        "A prior Alpaca Paper close has an unresolved result. Check Alpaca Orders "
+                        "before attempting another close."
+                    )
+                if existing["status"] in {"failed", "resolved_no_order"}:
+                    conn.execute(
+                        "UPDATE broker_close_intents SET status='submitting',broker_order_id=NULL,"
+                        "last_error=NULL,created_at=?,updated_at=? WHERE position_id=?",
+                        (now, now, position_id),
+                    )
+                else:
+                    conn.rollback()
+                    raise ValueError(
+                        f"Close-intent status is {existing['status']!r}; review broker state before retrying."
+                    )
+            else:
+                conn.execute(
+                    "INSERT INTO broker_close_intents(position_id,symbol,status,created_at,updated_at) "
+                    "VALUES (?,?, 'submitting',?,?)",
+                    (position_id, symbol.upper(), now, now),
+                )
+            conn.commit()
+            return dict(conn.execute(
+                "SELECT * FROM broker_close_intents WHERE position_id=?", (position_id,)
+            ).fetchone())
+
+    def update_broker_close_intent(
+        self, position_id: str, status: str, *,
+        broker_order_id: str | None = None, last_error: str | None = None,
+    ) -> None:
+        allowed = {
+            "submitting", "unknown", "recorded", "failed", "resolved_no_order",
+        }
+        if status not in allowed:
+            raise ValueError("Unsupported broker close-intent status.")
+        with self.connect() as conn:
+            conn.execute(
+                "UPDATE broker_close_intents SET status=?, "
+                "broker_order_id=COALESCE(?,broker_order_id), last_error=?, updated_at=? "
+                "WHERE position_id=?",
+                (status, broker_order_id, last_error[:500] if last_error else None,
+                 utc_now(), position_id),
             )
 
     def record_recovered_alpaca_paper_trade(
