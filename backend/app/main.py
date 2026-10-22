@@ -16,7 +16,7 @@ from fastapi.responses import JSONResponse
 from app.agent.controller import AgentController
 from app.agent.schemas import (
     AnalyzeRequest, ApprovalRequest, ChatRequest, ClosePositionRequest,
-    RejectRequest, ResearchRequest, UpdateStopsRequest, WatchlistRequest,
+    RejectRequest, ResearchRequest, ResolveBrokerIntentRequest, UpdateStopsRequest, WatchlistRequest,
 )
 from app.agent.tools import summarize_bars
 from app.config import get_settings
@@ -294,6 +294,22 @@ async def reject_proposal(proposal_id: str, request: RejectRequest) -> dict[str,
 async def execution_status() -> dict[str, Any]:
     """Broker/mode status. The adapter can connect only to Alpaca Paper, never live."""
     return paper_broker.execution_status()
+
+
+@app.post("/api/execution/intents/{proposal_id}/resolve-no-order")
+async def resolve_broker_intent(
+    proposal_id: str, request: ResolveBrokerIntentRequest
+) -> dict[str, Any]:
+    """Explicitly release a stale ambiguous intent after verifying Alpaca Paper has no order/position."""
+    try:
+        return paper_broker.resolve_unknown_order_intent(
+            proposal_id,
+            confirmed_no_order_and_no_position=request.confirm_no_order_and_no_position,
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except (ValueError, RuntimeError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
 @app.get("/api/portfolio")
