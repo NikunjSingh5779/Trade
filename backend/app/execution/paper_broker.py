@@ -521,6 +521,10 @@ class PaperBroker:
         broker_positions: list[dict[str, Any]] = []
         if alpaca_mode:
             account, broker_positions = self._require_reconciled_broker()
+            if proposal_record.get("side") == "short" and account.get("shorting_enabled") is False:
+                raise RiskRejected(
+                    "Short entries are disabled in this Alpaca Paper account configuration."
+                )
             try:
                 portfolio["equity"] = float(account["equity"])
             except (KeyError, TypeError, ValueError) as exc:
