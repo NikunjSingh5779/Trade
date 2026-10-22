@@ -35,6 +35,12 @@ class InferenceRouter:
             "hosted_fallback_enabled": eligible_hosted,
             "selected_mode": "local" if endpoints else ("hosted" if eligible_hosted else "offline"),
             "inference_concurrency_limit": 1,
+            # These are the effective settings used to construct this backend's client.
+            # They let the dashboard distinguish Trade's request cap from Strata's
+            # independent model/context configuration.
+            "max_output_tokens": self.settings.ai_max_output_tokens,
+            "reasoning_budget_tokens": self.settings.ai_reasoning_budget_tokens,
+            "request_timeout_seconds": self.settings.ai_request_timeout_seconds,
         }
 
     async def complete(self, messages: list[dict[str, str]]) -> tuple[str, dict[str, str]]:
