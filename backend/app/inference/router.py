@@ -15,7 +15,11 @@ class InferenceRouter:
     def __init__(self, settings: Settings, gate: InferenceGate):
         self.settings = settings
         self.gate = gate
-        self.client = OpenAICompatibleClient(settings.ai_request_timeout_seconds)
+        self.client = OpenAICompatibleClient(
+            timeout_seconds=settings.ai_request_timeout_seconds,
+            max_output_tokens=settings.ai_max_output_tokens,
+            reasoning_budget_tokens=settings.ai_reasoning_budget_tokens,
+        )
         self.discovery = EndpointDiscovery(
             settings.local_base_urls,
             settings.local_model_id,
