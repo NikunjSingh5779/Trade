@@ -37,6 +37,6 @@ PAPER_INITIAL_EQUITY applies only to local simulation. It does not change the Al
 
 - US-listed equities only; intraday timeframe only for new trade proposals and automated entries.
 - Local simulation and Alpaca Paper are separate. Local orders never appear on Alpaca.
-- The session gate excludes weekends/out-of-hours but still needs authoritative exchange holiday/early-close calendar integration.
+- The session gate uses the installed pandas-market-calendars NYSE schedule for holidays and early closes. The schedule is package-shipped, not fetched live, so dependency updates remain important.
 - The local simulation is simplified and does not model all fees, partial fills, borrow constraints or broker protections. Alpaca Paper is a simulator and not evidence of live execution quality or profit.
 - Keep the app running for monitoring and end-of-session handling; no local service can act while the machine/app is offline.
