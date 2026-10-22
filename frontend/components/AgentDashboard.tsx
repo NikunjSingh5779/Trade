@@ -108,7 +108,9 @@ export default function AgentDashboard() {
         { method: "POST", body: JSON.stringify({ version: proposal.version }) }
       );
       setNotice(action === "approve"
-        ? `Paper trade filled: ${proposal.symbol}, ${result.quantity} shares at simulated entry.`
+        ? (result.mode === "alpaca_paper"
+          ? `Alpaca Paper order filled: ${proposal.symbol}, ${result.quantity} shares. Verify the broker order in your Alpaca Paper account.`
+          : `Local simulation filled: ${proposal.symbol}, ${result.quantity} shares. This does not appear in Alpaca.`)
         : `Proposal for ${proposal.symbol} rejected.`);
       await refresh();
     } catch (e) { setError(e instanceof Error ? e.message : `Could not ${action} proposal`); }
@@ -121,9 +123,9 @@ export default function AgentDashboard() {
       const result = await api<{ status: string; bar_count?: number }>("/api/market/scan", { method: "POST" });
       setNotice(result.status === "queued"
         ? (market?.autonomous_paper_trading_enabled
-          ? `Autonomous paper scan queued; ${result.bar_count ?? 0} bars stored. Eligible decisions can open simulated positions after server-side risk checks.`
+          ? `Autonomous intraday scan queued; ${result.bar_count ?? 0} bars stored. Valid entries still must pass server-side risk checks.`
           : `Market scan queued; ${result.bar_count ?? 0} bars stored.`)
-        : "Scan completed without bars.");
+        : "Scan completed without fresh bars.");
       await refresh();
     } catch (e) { setError(e instanceof Error ? e.message : "Market scan failed"); }
     finally { setBusy(""); }
@@ -139,6 +141,9 @@ export default function AgentDashboard() {
   const autonomousResult = latestAutonomousScan?.result?.autonomous_trading;
   const latestScanAttempt = jobs.find(j => j.task === "market_scan");
   const localModel = inference?.local_endpoints?.[0]?.model_id;
+  const execution = portfolio?.execution_status;
+  const brokerMode = portfolio?.mode === "alpaca_paper";
+  const localOnlyPositions = portfolio?.local_simulation_positions ?? [];
 
   return (
     <main className="mx-auto min-h-screen max-w-[1500px] px-4 py-5 md:px-8 md:py-8">
@@ -163,7 +168,7 @@ export default function AgentDashboard() {
         <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
           <div>
             <div className="flex items-center gap-2 text-sm font-semibold"><Bot size={16} className="text-[#75e0b2]"/> Autonomous intraday paper trading</div>
-            <p className="mt-1 max-w-4xl text-xs leading-5 text-[#8e9cb2]">AI chooses Long, Short, or No Trade from completed regular-session candles. Valid entries are simulated automatically only after backend risk checks; remaining intraday positions are closed at the US regular-session close. Live order placement is disabled.</p>
+            <p className="mt-1 max-w-4xl text-xs leading-5 text-[#8e9cb2]">AI chooses Long, Short, or No Trade from completed five-minute candles during US regular hours. Orders go to Alpaca Paper only when that mode is explicitly enabled and reconciled; otherwise they stay in this app’s local simulation. New entries are intraday-only and live trading is disabled.</p>
             <div className="mt-3 flex flex-wrap gap-2">
               {(market?.autonomous_symbols ?? []).map(ticker => <span key={ticker} className="rounded-md border border-[#2b3c54] bg-[#0a1220] px-2 py-1 text-[10px] font-semibold tracking-wide text-[#cbd6e7]">{ticker}</span>)}
             </div>
@@ -173,13 +178,19 @@ export default function AgentDashboard() {
             <span className="text-center text-[#8e9cb2]">{market?.regular_us_session ? "US regular session open" : "Outside US regular session"}</span>
           </div>
         </div>
+        {execution && <div className={`mt-4 rounded-lg border p-3 text-xs ${execution.enabled && (!execution.connected || execution.reconciled === false) ? "border-amber-700/60 bg-amber-950/30 text-amber-100" : "border-[#26384f] bg-[#0a1220] text-[#a8b5c8]"}`}>
+          <div className="font-semibold">{execution.mode === "alpaca_paper" ? (execution.connected ? "Alpaca Paper API connected" : "Alpaca Paper API not connected") : "Local simulation mode"}</div>
+          <p className="mt-1 leading-5">{execution.error ?? execution.note ?? "Execution status is not available."}</p>
+          {!!execution.issues?.length && <div className="mt-2 space-y-1">{execution.issues.map((issue, i) => <p key={`${issue}-${i}`}>• {issue}</p>)}</div>}
+          {execution.connected && execution.account?.equity && <p className="mt-2">Alpaca account equity: <strong>{money(Number(execution.account.equity))}</strong> · buying power: {money(Number(execution.account.buying_power ?? 0))}</p>}
+        </div>}
       </Panel>
 
       <div className="mb-5 grid grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-4">
         {[
-          { label: "Paper equity", value: money(portfolio?.equity ?? 100000), Icon: Wallet, note: "Simulated account" },
-          { label: "Open positions", value: String(portfolio?.open_positions.length ?? 0), Icon: TrendingUp, note: `Gross ${money(portfolio?.gross_exposure ?? 0)}` },
-          { label: "Unrealized P&L", value: money(portfolio?.unrealized_pnl ?? 0), Icon: (portfolio?.unrealized_pnl ?? 0) >= 0 ? ArrowUpRight : ArrowDownRight, note: "Based on current marks" },
+          { label: brokerMode ? "Alpaca Paper equity" : "Local simulation equity", value: money(portfolio?.equity ?? 100000), Icon: Wallet, note: brokerMode ? "Source: Alpaca account API" : "Local SQLite only; not Alpaca" },
+          { label: brokerMode ? "Alpaca open positions" : "Local open positions", value: String(portfolio?.open_positions.length ?? 0), Icon: TrendingUp, note: `Gross exposure ${money(portfolio?.gross_exposure ?? 0)}` },
+          { label: "Unrealized P&L", value: money(portfolio?.unrealized_pnl ?? 0), Icon: (portfolio?.unrealized_pnl ?? 0) >= 0 ? ArrowUpRight : ArrowDownRight, note: brokerMode ? "Alpaca-reported position P&L" : "Local simulation marks" },
           { label: "AI queue", value: String(health?.queue_depth ?? "—"), Icon: Activity, note: "Max one inference active" }
         ].map((item) => (
           <Panel key={item.label} className="p-4">
@@ -189,6 +200,8 @@ export default function AgentDashboard() {
           </Panel>
         ))}
       </div>
+
+      <p className="mb-5 text-xs leading-5 text-[#8e9cb2]">Capital and risk clarification: $100,000 is the default starting equity. At 0.25% risk per trade, the initial loss budget is $250 (= $100,000 × 0.0025), not the trade size. Position size is further limited by stop distance and exposure caps. Alpaca account balances are separate from local simulation balances.</p>
 
       <div className="grid grid-cols-1 gap-5 xl:grid-cols-[minmax(0,1.2fr)_minmax(360px,.8fr)]">
         <div className="flex flex-col gap-5">
@@ -273,16 +286,25 @@ export default function AgentDashboard() {
           </Panel>
 
           <Panel className="p-5">
-            <SectionTitle icon={Wallet} title="Open paper positions" note="Simulated only"/>
+            <SectionTitle icon={Wallet} title={brokerMode ? "Open Alpaca Paper positions" : "Open local simulation positions"} note={brokerMode ? "Broker-reported account" : "SQLite only · not sent to Alpaca"}/>
             <div className="mt-4 overflow-x-auto">
               <table className="w-full min-w-[800px] text-left text-xs">
-                <thead className="text-[#71819a]"><tr className="border-b border-[#263449]"><th className="pb-3 font-medium">Symbol</th><th className="pb-3 font-medium">Side / Qty</th><th className="pb-3 font-medium">Entry</th><th className="pb-3 font-medium">Mark</th><th className="pb-3 font-medium">Stop / Target</th><th className="pb-3 font-medium">Manage</th></tr></thead>
-                <tbody>{(portfolio?.open_positions ?? []).map(pos => <tr key={pos.id} className="border-b border-[#1f2b3d] last:border-0"><td className="py-3 font-semibold">{pos.symbol}</td><td className="py-3 capitalize">{pos.side} / {pos.quantity}</td><td className="py-3">{money(pos.entry_price)}</td><td className="py-3">{money(pos.current_price)}</td><td className="py-3">{money(pos.stop_loss)} / {money(pos.take_profit)}</td><td className="py-3"><PositionActions position={pos} onChanged={() => void refresh()}/></td></tr>)}
-                  {(portfolio?.open_positions ?? []).length === 0 && <tr><td colSpan={5} className="py-6 text-center text-[#71819a]">No open paper positions yet.</td></tr>}
+                <thead className="text-[#71819a]"><tr className="border-b border-[#263449]"><th className="pb-3 font-medium">Symbol</th><th className="pb-3 font-medium">Side / Qty</th><th className="pb-3 font-medium">Entry</th><th className="pb-3 font-medium">Mark</th><th className="pb-3 font-medium">Stop / Target</th><th className="pb-3 font-medium">Execution</th><th className="pb-3 font-medium">Manage</th></tr></thead>
+                <tbody>{(portfolio?.open_positions ?? []).map(pos => <tr key={pos.id} className="border-b border-[#1f2b3d] last:border-0"><td className="py-3 font-semibold">{pos.symbol}</td><td className="py-3 capitalize">{pos.side} / {pos.quantity}</td><td className="py-3">{money(pos.entry_price)}</td><td className="py-3">{money(pos.current_price)}</td><td className="py-3">{money(pos.stop_loss)} / {money(pos.take_profit)}</td><td className="py-3">{pos.execution_mode === "alpaca_paper" ? "Alpaca Paper" : "Local simulation"}</td><td className="py-3"><PositionActions position={pos} onChanged={() => void refresh()}/></td></tr>)}
+                  {(portfolio?.open_positions ?? []).length === 0 && <tr><td colSpan={7} className="py-6 text-center text-[#71819a]">{brokerMode ? "No Alpaca Paper positions are currently tracked." : "No local simulation positions are open."}</td></tr>}
                 </tbody>
               </table>
             </div>
           </Panel>
+          {localOnlyPositions.length > 0 && <Panel className="p-5">
+            <SectionTitle icon={CircleAlert} title="Legacy local-only positions" note="Not in Alpaca"/>
+            <p className="mt-2 text-xs leading-5 text-amber-100">These rows are local simulations from before Alpaca Paper routing was enabled. They are not broker holdings and are excluded from Alpaca equity/P&L. Review each before using “Close at mark”; that closes only the local simulation.</p>
+            <div className="mt-4 space-y-3">{localOnlyPositions.map(pos => <div key={pos.id} className="rounded-xl border border-[#2b3c54] bg-[#0a1220] p-3">
+              <div className="mb-3 flex flex-wrap items-center justify-between gap-2"><div className="text-sm font-semibold">{pos.symbol} · {pos.side.toUpperCase()} · {pos.quantity} shares</div><span className="rounded border border-amber-700/60 px-2 py-1 text-[10px] text-amber-100">LOCAL ONLY</span></div>
+              <div className="grid grid-cols-2 gap-2 text-xs text-[#a8b5c8] sm:grid-cols-4"><div>Entry <strong>{money(pos.entry_price)}</strong></div><div>Mark <strong>{money(pos.current_price)}</strong></div><div>Stop <strong>{money(pos.stop_loss)}</strong></div><div>Target <strong>{money(pos.take_profit)}</strong></div></div>
+              <div className="mt-3"><PositionActions position={pos} onChanged={() => void refresh()}/></div>
+            </div>)}</div>
+          </Panel>}
         </div>
 
         <div className="flex flex-col gap-5">
@@ -293,6 +315,8 @@ export default function AgentDashboard() {
                 ["Backend", health?.status === "ok" ? "Online" : "Connecting", health?.status === "ok"],
                 ["Local model", localModel ?? (inference?.selected_mode === "hosted" ? "Hosted fallback" : "Not detected"), Boolean(inference?.local_available)],
                 ["Market data credentials", market?.provider_configured ? "Configured" : "Not configured", Boolean(market?.provider_configured)],
+                ["Order execution", execution?.mode === "alpaca_paper" ? (execution.connected ? "Alpaca Paper account" : "Alpaca Paper configured but offline") : "Local simulation only", execution?.mode !== "alpaca_paper" || Boolean(execution.connected)],
+                ["Broker reconciliation", execution?.mode !== "alpaca_paper" ? "Not applicable in local mode" : execution.reconciled ? "Matched" : "Blocked: review issues above", execution?.mode !== "alpaca_paper" || Boolean(execution.reconciled)],
                 ["Market session", market?.regular_us_session ? "Regular session" : "Outside regular hours", Boolean(market?.regular_us_session)],
                 ["AI generation budget", inference?.max_output_tokens != null
                   ? `${inference.max_output_tokens.toLocaleString()} max output · ${inference.reasoning_budget_tokens?.toLocaleString() ?? "—"} reasoning · ${inference.request_timeout_seconds ?? "—"}s timeout`
@@ -307,7 +331,7 @@ export default function AgentDashboard() {
                 <li className="flex gap-2"><Check size={13} className="shrink-0 text-[#75e0b2]"/>{market?.autonomous_paper_trading_enabled
                   ? "Automated entries still require backend risk checks; manual proposals require approval"
                   : "New positions require explicit manual approval"}</li>
-                <li className="flex gap-2"><Check size={13} className="shrink-0 text-[#75e0b2]"/> Live order execution is not implemented</li>
+                <li className="flex gap-2"><Check size={13} className="shrink-0 text-[#75e0b2]"/> Live orders are never supported; broker mode can target Alpaca Paper only</li>
                 <li className="flex gap-2"><Check size={13} className="shrink-0 text-[#75e0b2]"/> Strategy promotion is manual only</li>
               </ul>
             </div>
