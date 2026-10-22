@@ -70,6 +70,11 @@ def test_autonomous_decision_opens_only_a_valid_paper_position(tmp_path, monkeyp
     import app.execution.paper_broker as broker_module
 
     monkeypatch.setattr(broker_module, "is_regular_us_session", lambda now=None: True)
+    monkeypatch.setattr(
+        broker_module, "us_session_bounds",
+        lambda session_day: (datetime.now(UTC) - timedelta(hours=1),
+                             datetime.now(UTC) + timedelta(hours=1)),
+    )
     monkeypatch.setattr(broker_module, "is_regular_us_bar", lambda bar: True)
     settings = _settings(tmp_path)
     db = Database(settings.database_path)
