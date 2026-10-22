@@ -193,7 +193,10 @@ class PaperBroker:
                     recorded = self.db.record_recovered_alpaca_paper_trade(
                         proposal_id, int(pending["version"]), quantity, fill_price, order_id
                     )
-                    closed = self.db.close_position(recorded["position_id"], exit_price)
+                    closed = self.db.close_position(
+                        recorded["position_id"], exit_price,
+                        pricing_method_override="alpaca_paper_bracket_exit_fill",
+                    )
                     event = {
                         **closed, "symbol": symbol, "reason": str(exit_leg.get("type") or "alpaca_bracket_exit"),
                         "broker_order_id": exit_leg.get("id"), "mode": "alpaca_paper",
@@ -250,7 +253,10 @@ class PaperBroker:
                     continue
                 try:
                     exit_price = float(exit_leg["filled_avg_price"])
-                    result = self.db.close_position(str(position["id"]), exit_price)
+                    result = self.db.close_position(
+                        str(position["id"]), exit_price,
+                        pricing_method_override="alpaca_paper_bracket_exit_fill",
+                    )
                     event = {
                         **result, "symbol": symbol,
                         "reason": str(exit_leg.get("type") or "alpaca_bracket_exit"),
@@ -388,7 +394,9 @@ class PaperBroker:
             raise AlpacaPaperError(
                 "Alpaca returned a close order without a confirmed fill price; local position remains open."
             ) from exc
-        result = self.db.close_position(position_id, exit_price)
+        result = self.db.close_position(
+            position_id, exit_price, pricing_method_override="alpaca_paper_broker_fill"
+        )
         result.update({"mode": "alpaca_paper", "execution_mode": "alpaca_paper",
                        "broker_order_id": order.get("id"), "reason": reason})
         self.db.add_audit("alpaca_paper.position_closed", result)
