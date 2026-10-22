@@ -259,11 +259,12 @@ class Database:
             raise ValueError("Unsupported position timeframe.")
         with self.connect() as conn:
             rows = conn.execute(
-                "SELECT symbol, COALESCE(last_processed_bar_at, opened_at) AS start_time "
+                "SELECT symbol, execution_mode, COALESCE(last_processed_bar_at, opened_at) AS start_time "
                 "FROM positions WHERE status='open' AND timeframe=? ORDER BY symbol",
                 (timeframe,),
             ).fetchall()
-            return [{"symbol": row["symbol"], "start_time": row["start_time"]} for row in rows]
+            return [{"symbol": row["symbol"], "start_time": row["start_time"],
+                     "execution_mode": row["execution_mode"]} for row in rows]
 
     def list_open_position_symbols(self, timeframe: str | None = None) -> list[str]:
         with self.connect() as conn:
