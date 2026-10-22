@@ -22,6 +22,8 @@ export type AutonomousDecisionOutcome = {
   side?: "long" | "short" | string;
   quantity?: number;
   simulated_price?: number;
+  execution_mode?: "local_simulation" | "alpaca_paper" | string;
+  broker_order_id?: string | null;
   reason?: string;
 };
 export type AutonomousTradingSummary = {
