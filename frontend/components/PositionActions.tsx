@@ -63,7 +63,7 @@ export default function PositionActions({
       )}
       <button onClick={() => void closeAtMark()} disabled={busy}
         className="flex w-full items-center justify-center gap-1.5 rounded border border-[#4a3c47] px-2 py-1.5 text-xs text-[#ffbdc6] hover:bg-[#2b1923] disabled:opacity-50">
-        <LogOut size={13}/> Close at mark
+        <LogOut size={13}/> {position.execution_mode === "alpaca_paper" ? "Close via Alpaca Paper" : "Close at local mark"}
       </button>
       {error && <p className="max-w-[230px] whitespace-normal text-[11px] text-red-300">{error}</p>}
     </div>
