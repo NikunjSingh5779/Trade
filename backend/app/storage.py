@@ -494,6 +494,15 @@ class Database:
                 if existing["client_order_id"] != client_order_id:
                     conn.rollback()
                     raise ValueError("Proposal already has a different broker order intent.")
+                if existing["status"] == "failed":
+                    conn.execute(
+                        "UPDATE broker_order_intents SET status='submitting',last_error=NULL,updated_at=? "
+                        "WHERE proposal_id=?",
+                        (now, proposal_id),
+                    )
+                    existing = conn.execute(
+                        "SELECT * FROM broker_order_intents WHERE proposal_id=?", (proposal_id,)
+                    ).fetchone()
                 conn.commit()
                 return dict(existing)
             conn.execute(
