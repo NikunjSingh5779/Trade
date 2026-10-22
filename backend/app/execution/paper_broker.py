@@ -235,6 +235,105 @@ class PaperBroker:
         # Reload because the recovery pass can add positions or reconcile bracket exits.
         remote = self.alpaca.positions()
         remote_by_symbol = {str(row.get("symbol", "")).upper(): row for row in remote}
+        # Reconcile close requests whose DELETE response timed out. Never send another
+        # close when a matching market order may already be open or filled.
+        with self.db.connect() as conn:
+            pending_closes = conn.execute(
+                "SELECT ci.*, p.status AS position_status, p.side, p.quantity, "
+                "p.execution_mode, p.entry_price FROM broker_close_intents ci "
+                "JOIN positions p ON p.id=ci.position_id "
+                "WHERE ci.status IN ('submitting','unknown') ORDER BY ci.created_at"
+            ).fetchall()
+        for intent_row in pending_closes:
+            intent = dict(intent_row)
+            position_id = str(intent["position_id"])
+            symbol = str(intent["symbol"]).upper()
+            if intent["position_status"] != "open":
+                self.db.update_broker_close_intent(
+                    position_id, "recorded", broker_order_id=intent.get("broker_order_id")
+                )
+                continue
+            try:
+                recent_orders = self.alpaca.list_orders(
+                    symbol=symbol, after=str(intent["created_at"]), limit=100
+                )
+            except AlpacaPaperError as exc:
+                issues.append(
+                    f"{symbol}: could not reconcile an ambiguous close ({type(exc).__name__}); "
+                    "do not retry the close until Alpaca Orders is checked."
+                )
+                continue
+
+            close_order = self._matching_market_close_order(recent_orders, intent)
+            if close_order is not None:
+                close_status = str(close_order.get("status") or "unknown").lower()
+                try:
+                    filled_qty = abs(float(close_order.get("filled_qty") or 0))
+                    requested_qty = abs(float(close_order.get("qty") or intent["quantity"]))
+                except (TypeError, ValueError):
+                    filled_qty, requested_qty = 0.0, abs(float(intent["quantity"]))
+
+                if close_status in {"canceled", "rejected", "expired"} and filled_qty <= 0:
+                    self.db.update_broker_close_intent(
+                        position_id, "failed", broker_order_id=str(close_order.get("id") or ""),
+                        last_error=f"Alpaca close order ended as {close_status} without a fill.",
+                    )
+                    self.db.add_audit("alpaca_paper.close_reconciled_not_filled", {
+                        "position_id": position_id, "symbol": symbol,
+                        "broker_order_id": close_order.get("id"), "status": close_status,
+                    })
+                    continue
+
+                if (
+                    close_status == "filled" and filled_qty > 0
+                    and abs(filled_qty - requested_qty) <= 1e-6
+                    and symbol not in remote_by_symbol
+                ):
+                    try:
+                        exit_price = float(close_order.get("filled_avg_price") or 0)
+                        if exit_price <= 0:
+                            raise ValueError("missing confirmed average fill price")
+                        result = self.db.close_position(
+                            position_id, exit_price,
+                            pricing_method_override="alpaca_paper_broker_fill_recovered",
+                        )
+                        result.update({
+                            "symbol": symbol, "mode": "alpaca_paper",
+                            "broker_order_id": close_order.get("id"),
+                            "reason": "ambiguous_close_recovered",
+                        })
+                        self.db.update_broker_close_intent(
+                            position_id, "recorded", broker_order_id=str(close_order.get("id") or ""),
+                        )
+                        self.db.add_audit("alpaca_paper.close_recovered", result)
+                        auto_closed.append(result)
+                    except (KeyError, ValueError, TypeError) as exc:
+                        issues.append(
+                            f"{symbol}: a close order appears filled but its local record could not be reconciled "
+                            f"({type(exc).__name__})."
+                        )
+                    continue
+
+                self.db.update_broker_close_intent(
+                    position_id, "unknown", broker_order_id=str(close_order.get("id") or ""),
+                    last_error=f"Matching close order is not fully reconciled (status={close_status}, filled_qty={filled_qty}).",
+                )
+                issues.append(
+                    f"{symbol}: a matching close order exists in Alpaca (status={close_status}, "
+                    f"filled quantity {filled_qty:g}); do not submit another close."
+                )
+                continue
+
+            if symbol in remote_by_symbol:
+                self.db.update_broker_close_intent(
+                    position_id, "unknown",
+                    last_error="No matching market close order was returned; broker position remains open.",
+                )
+                issues.append(
+                    f"{symbol}: a prior close response is unresolved and no matching close order is visible. "
+                    "Verify Alpaca Paper Orders before resolving or retrying."
+                )
+
         local = self._local_open_positions()
         tracked = {
             str(row["symbol"]).upper(): row for row in local
@@ -264,6 +363,10 @@ class PaperBroker:
                         "broker_order_id": exit_leg.get("id"),
                         "mode": "alpaca_paper",
                     }
+                    self.db.update_broker_close_intent(
+                        str(position["id"]), "recorded",
+                        broker_order_id=str(exit_leg.get("id") or ""),
+                    )
                     self.db.add_audit("alpaca_paper.position_reconciled_closed", event)
                     auto_closed.append(event)
                 except (KeyError, ValueError, TypeError) as exc:
