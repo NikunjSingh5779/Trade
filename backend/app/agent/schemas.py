@@ -32,7 +32,7 @@ class TradeProposal(BaseModel):
     thesis: str = Field(min_length=10, max_length=3000)
     evidence: list[str] = Field(default_factory=list, max_length=20)
     strategy_id: str = Field(default="ai-proposed", max_length=100)
-    timeframe: Literal["intraday", "swing"] = "intraday"
+    timeframe: Literal["intraday"] = "intraday"
 
     @field_validator("symbol")
     @classmethod
