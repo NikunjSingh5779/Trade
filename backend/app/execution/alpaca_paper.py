@@ -129,7 +129,7 @@ class AlpacaPaperTrading:
             raise AlpacaPaperError("Alpaca Paper order response was not an object.")
         return body
 
-    def _wait_for_fill(self, order: dict[str, Any], attempts: int = 8) -> dict[str, Any]:
+    def _wait_for_fill(self, order: dict[str, Any], attempts: int = 20) -> dict[str, Any]:
         order_id = str(order.get("id", "")).strip()
         if not order_id:
             raise AlpacaOrderOutcomeUnknown(
