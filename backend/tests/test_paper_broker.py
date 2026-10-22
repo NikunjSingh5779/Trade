@@ -79,14 +79,18 @@ def test_staleness_limit_comes_from_the_server_stamped_timeframe(tmp_path):
     assert db.get_proposal(proposal["id"])["status"] == "pending"
 
 
-def test_swing_data_within_a_week_is_approvable(tmp_path):
+def test_new_swing_positions_are_rejected_in_intraday_only_mode(tmp_path):
     settings, db = _setup(tmp_path)
     two_days_ago = (datetime.now(UTC) - timedelta(days=2)).isoformat()
     proposal = db.add_proposal(
         _body(timeframe="swing", data_timeframe="swing", data_asof=two_days_ago)
     )
 
-    assert PaperBroker(settings, db).approve(proposal["id"], 1)["mode"] == "paper"
+    with pytest.raises(RiskRejected, match="intraday proposals only"):
+        PaperBroker(settings, db).approve(proposal["id"], 1)
+
+    assert db.get_proposal(proposal["id"])["status"] == "pending"
+    assert db.list_orders() == []
 
 
 @pytest.mark.parametrize("stamp", [None, "", "weekly"])

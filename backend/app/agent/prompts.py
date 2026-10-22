@@ -16,9 +16,9 @@ TASK_PROMPTS = {
         "If evidence is insufficient, say there are no actionable setups. Do not output orders."
     ),
     "analyze_proposal": (
-        "Assess the supplied candles and indicators for a possible US equity setup. Follow requested timeframe. "
+        "Assess the supplied completed five-minute candles and indicators for a possible US equity intraday setup. "
         "Return exactly one JSON object with keys symbol, side (long/short), entry_price, stop_loss, "
-        "take_profit, thesis, evidence (string array), strategy_id, timeframe (intraday/swing). "
+        "take_profit, thesis, evidence (string array), strategy_id, and timeframe set to 'intraday'. "
         "If the data does not support a defensible setup, return "
         '{"no_setup": true, "reason": "..."} instead. Use only prices and timestamps present in the payload. '
         "A proposal is not an order. Do not include quantity; deterministic code calculates it."

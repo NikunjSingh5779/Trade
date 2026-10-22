@@ -48,6 +48,7 @@ export default function AgentDashboard() {
   const [busy, setBusy] = useState("");
   const [notice, setNotice] = useState("");
   const [error, setError] = useState("");
+  const [resolveConfirmations, setResolveConfirmations] = useState<Record<string, boolean>>({});
 
   const refresh = useCallback(async () => {
     try {
@@ -108,7 +109,9 @@ export default function AgentDashboard() {
         { method: "POST", body: JSON.stringify({ version: proposal.version }) }
       );
       setNotice(action === "approve"
-        ? `Paper trade filled: ${proposal.symbol}, ${result.quantity} shares at simulated entry.`
+        ? (result.mode === "alpaca_paper"
+          ? `Alpaca Paper order filled: ${proposal.symbol}, ${result.quantity} shares. Verify the broker order in your Alpaca Paper account.`
+          : `Local simulation filled: ${proposal.symbol}, ${result.quantity} shares. This does not appear in Alpaca.`)
         : `Proposal for ${proposal.symbol} rejected.`);
       await refresh();
     } catch (e) { setError(e instanceof Error ? e.message : `Could not ${action} proposal`); }
@@ -121,12 +124,57 @@ export default function AgentDashboard() {
       const result = await api<{ status: string; bar_count?: number }>("/api/market/scan", { method: "POST" });
       setNotice(result.status === "queued"
         ? (market?.autonomous_paper_trading_enabled
-          ? `Autonomous paper scan queued; ${result.bar_count ?? 0} bars stored. Eligible decisions can open simulated positions after server-side risk checks.`
+          ? `Autonomous intraday scan queued; ${result.bar_count ?? 0} bars stored. Valid entries still must pass server-side risk checks.`
           : `Market scan queued; ${result.bar_count ?? 0} bars stored.`)
-        : "Scan completed without bars.");
+        : "Scan completed without fresh bars.");
       await refresh();
     } catch (e) { setError(e instanceof Error ? e.message : "Market scan failed"); }
     finally { setBusy(""); }
+  }
+
+  async function resolveNoOrder(proposalId: string, symbolName: string) {
+    if (!resolveConfirmations[proposalId]) {
+      setError("Confirm that you checked both Alpaca Paper Orders and Positions first.");
+      return;
+    }
+    setBusy(`resolve:${proposalId}`); setNotice(""); setError("");
+    try {
+      const result = await api<{ status: string; symbol: string; note: string }>(
+        `/api/execution/intents/${proposalId}/resolve-no-order`,
+        {
+          method: "POST",
+          body: JSON.stringify({ confirm_no_order_and_no_position: true })
+        }
+      );
+      setNotice(`${result.symbol || symbolName}: ${result.note}`);
+      setResolveConfirmations(previous => ({ ...previous, [proposalId]: false }));
+      await refresh();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Could not resolve the unknown broker order.");
+    } finally { setBusy(""); }
+  }
+
+  async function resolveCloseNoOrder(positionId: string, symbolName: string) {
+    const confirmationKey = `close:${positionId}`;
+    if (!resolveConfirmations[confirmationKey]) {
+      setError("Confirm that you checked Alpaca Paper Orders and verified the position is still open.");
+      return;
+    }
+    setBusy(`resolve-close:${positionId}`); setNotice(""); setError("");
+    try {
+      const result = await api<{ status: string; symbol: string; note: string }>(
+        `/api/execution/closes/${positionId}/resolve-no-order`,
+        {
+          method: "POST",
+          body: JSON.stringify({ confirm_no_close_order_and_position_open: true })
+        }
+      );
+      setNotice(`${result.symbol || symbolName}: ${result.note}`);
+      setResolveConfirmations(previous => ({ ...previous, [confirmationKey]: false }));
+      await refresh();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Could not resolve the unknown broker close.");
+    } finally { setBusy(""); }
   }
 
   const pending = proposals.filter(p => p.status === "pending");
@@ -139,6 +187,15 @@ export default function AgentDashboard() {
   const autonomousResult = latestAutonomousScan?.result?.autonomous_trading;
   const latestScanAttempt = jobs.find(j => j.task === "market_scan");
   const localModel = inference?.local_endpoints?.[0]?.model_id;
+  const execution = portfolio?.execution_status;
+  const brokerMode = portfolio?.mode === "alpaca_paper";
+  const localOnlyPositions = portfolio?.local_simulation_positions ?? [];
+  const brokerOfflinePositions = portfolio?.broker_backed_positions_pending_reconciliation ?? [];
+  const displayedPositionCount = brokerMode
+    ? (execution?.broker_position_count ?? portfolio?.open_positions.length ?? 0)
+    : portfolio?.mode === "alpaca_paper_disconnected"
+      ? localOnlyPositions.length
+      : (portfolio?.open_positions.length ?? 0);
 
   return (
     <main className="mx-auto min-h-screen max-w-[1500px] px-4 py-5 md:px-8 md:py-8">
@@ -163,7 +220,7 @@ export default function AgentDashboard() {
         <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
           <div>
             <div className="flex items-center gap-2 text-sm font-semibold"><Bot size={16} className="text-[#75e0b2]"/> Autonomous intraday paper trading</div>
-            <p className="mt-1 max-w-4xl text-xs leading-5 text-[#8e9cb2]">AI chooses Long, Short, or No Trade from completed regular-session candles. Valid entries are simulated automatically only after backend risk checks; remaining intraday positions are closed at the US regular-session close. Live order placement is disabled.</p>
+            <p className="mt-1 max-w-4xl text-xs leading-5 text-[#8e9cb2]">AI chooses Long, Short, or No Trade from completed five-minute candles during US regular hours. Orders go to Alpaca Paper only when that mode is explicitly enabled and reconciled; otherwise they stay in this app’s local simulation. New entries are intraday-only and live trading is disabled.</p>
             <div className="mt-3 flex flex-wrap gap-2">
               {(market?.autonomous_symbols ?? []).map(ticker => <span key={ticker} className="rounded-md border border-[#2b3c54] bg-[#0a1220] px-2 py-1 text-[10px] font-semibold tracking-wide text-[#cbd6e7]">{ticker}</span>)}
             </div>
@@ -173,13 +230,69 @@ export default function AgentDashboard() {
             <span className="text-center text-[#8e9cb2]">{market?.regular_us_session ? "US regular session open" : "Outside US regular session"}</span>
           </div>
         </div>
+        {execution && <div className={`mt-4 rounded-lg border p-3 text-xs ${execution.enabled && (!execution.connected || execution.reconciled === false) ? "border-amber-700/60 bg-amber-950/30 text-amber-100" : "border-[#26384f] bg-[#0a1220] text-[#a8b5c8]"}`}>
+          <div className="font-semibold">{execution.mode === "alpaca_paper" ? (execution.connected ? "Alpaca Paper API connected" : "Alpaca Paper API not connected") : "Local simulation mode"}</div>
+          <p className="mt-1 leading-5">{execution.error ?? execution.note ?? "Execution status is not available."}</p>
+          {!!execution.issues?.length && <div className="mt-2 space-y-1">{execution.issues.map((issue, i) => <p key={`${issue}-${i}`}>• {issue}</p>)}</div>}
+          {execution.connected && execution.account?.equity && <p className="mt-2">Alpaca account equity: <strong>{money(Number(execution.account.equity))}</strong> · buying power: {money(Number(execution.account.buying_power ?? 0))}</p>}
+          {execution.mode === "alpaca_paper" && !!execution.unresolved_intents?.length && <div className="mt-4 space-y-3 border-t border-[#34445a] pt-3">
+            <div className="font-semibold text-amber-100">Unresolved Alpaca Paper submissions</div>
+            <p className="leading-5 text-amber-100/90">New broker entries stay blocked while any order result is ambiguous. Only resolve one after waiting at least 120 seconds and manually checking both the Alpaca Paper Orders page and Positions page for that symbol. If an order or position exists, do not release it.</p>
+            {execution.unresolved_intents.map(intent => <div key={intent.proposal_id} className="rounded-lg border border-amber-800/70 bg-[#111827] p-3">
+              <div className="flex flex-wrap items-center justify-between gap-2"><strong>{intent.symbol}</strong><span className="text-[10px] uppercase tracking-wide">{intent.status.replaceAll("_", " ")} · proposal {intent.proposal_status}</span></div>
+              <p className="mt-1 text-[10px] text-[#9eacc0]">Intent created: {new Date(intent.created_at).toLocaleString()}</p>
+              <label className="mt-3 flex cursor-pointer items-start gap-2 leading-5">
+                <input
+                  type="checkbox"
+                  className="mt-1"
+                  checked={Boolean(resolveConfirmations[intent.proposal_id])}
+                  onChange={event => setResolveConfirmations(previous => ({
+                    ...previous, [intent.proposal_id]: event.target.checked
+                  }))}
+                />
+                <span>I checked Alpaca Paper Orders and Positions. Neither shows this order or a position for {intent.symbol}.</span>
+              </label>
+              <button
+                type="button"
+                disabled={!resolveConfirmations[intent.proposal_id] || Boolean(busy)}
+                onClick={() => void resolveNoOrder(intent.proposal_id, intent.symbol)}
+                className="mt-3 rounded-lg border border-amber-700 px-3 py-2 text-xs font-semibold text-amber-100 disabled:cursor-not-allowed disabled:opacity-40"
+              >{busy === `resolve:${intent.proposal_id}` ? "Checking…" : "Release after verification"}</button>
+            </div>)}
+          </div>}
+          {execution.mode === "alpaca_paper" && !!execution.unresolved_closes?.length && <div className="mt-4 space-y-3 border-t border-[#34445a] pt-3">
+            <div className="font-semibold text-amber-100">Unresolved Alpaca Paper closes</div>
+            <p className="leading-5 text-amber-100/90">A prior close request may still have reached Alpaca. Trade will not send another close while that outcome is uncertain. Wait at least 120 seconds, check Alpaca Paper Orders for a matching market close order, and confirm the position is still open before releasing it.</p>
+            {execution.unresolved_closes.map(intent => <div key={intent.position_id} className="rounded-lg border border-amber-800/70 bg-[#111827] p-3">
+              <div className="flex flex-wrap items-center justify-between gap-2"><strong>{intent.symbol} · {intent.side.toUpperCase()} · {intent.quantity} shares</strong><span className="text-[10px] uppercase tracking-wide">{intent.status.replaceAll("_", " ")}</span></div>
+              <p className="mt-1 text-[10px] text-[#9eacc0]">Close intent created: {new Date(intent.created_at).toLocaleString()}</p>
+              <label className="mt-3 flex cursor-pointer items-start gap-2 leading-5">
+                <input
+                  type="checkbox"
+                  className="mt-1"
+                  checked={Boolean(resolveConfirmations[`close:${intent.position_id}`])}
+                  onChange={event => setResolveConfirmations(previous => ({
+                    ...previous, [`close:${intent.position_id}`]: event.target.checked
+                  }))}
+                />
+                <span>I checked Alpaca Paper Orders: no matching market close order is open or filled, and Alpaca Paper still shows this position open.</span>
+              </label>
+              <button
+                type="button"
+                disabled={!resolveConfirmations[`close:${intent.position_id}`] || Boolean(busy)}
+                onClick={() => void resolveCloseNoOrder(intent.position_id, intent.symbol)}
+                className="mt-3 rounded-lg border border-amber-700 px-3 py-2 text-xs font-semibold text-amber-100 disabled:cursor-not-allowed disabled:opacity-40"
+              >{busy === `resolve-close:${intent.position_id}` ? "Checking…" : "Release close retry after verification"}</button>
+            </div>)}
+          </div>}
+        </div>}
       </Panel>
 
       <div className="mb-5 grid grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-4">
         {[
-          { label: "Paper equity", value: money(portfolio?.equity ?? 100000), Icon: Wallet, note: "Simulated account" },
-          { label: "Open positions", value: String(portfolio?.open_positions.length ?? 0), Icon: TrendingUp, note: `Gross ${money(portfolio?.gross_exposure ?? 0)}` },
-          { label: "Unrealized P&L", value: money(portfolio?.unrealized_pnl ?? 0), Icon: (portfolio?.unrealized_pnl ?? 0) >= 0 ? ArrowUpRight : ArrowDownRight, note: "Based on current marks" },
+          { label: brokerMode ? "Alpaca Paper equity" : portfolio?.mode === "alpaca_paper_disconnected" ? "Local ledger equity" : "Local simulation equity", value: portfolio ? money(portfolio.equity) : "Connecting…", Icon: Wallet, note: brokerMode ? "Source: Alpaca account API" : portfolio?.mode === "alpaca_paper_disconnected" ? "Alpaca unavailable; local figures only" : "Local SQLite only; not Alpaca" },
+          { label: brokerMode ? "Alpaca open positions" : portfolio?.mode === "alpaca_paper_disconnected" ? "Legacy local positions" : "Local open positions", value: portfolio ? String(displayedPositionCount) : "—", Icon: TrendingUp, note: `Gross exposure ${money(portfolio?.gross_exposure ?? 0)}` },
+          { label: "Unrealized P&L", value: money(portfolio?.unrealized_pnl ?? 0), Icon: (portfolio?.unrealized_pnl ?? 0) >= 0 ? ArrowUpRight : ArrowDownRight, note: brokerMode ? "Alpaca-reported position P&L" : "Local simulation marks" },
           { label: "AI queue", value: String(health?.queue_depth ?? "—"), Icon: Activity, note: "Max one inference active" }
         ].map((item) => (
           <Panel key={item.label} className="p-4">
@@ -189,6 +302,8 @@ export default function AgentDashboard() {
           </Panel>
         ))}
       </div>
+
+      <p className="mb-5 text-xs leading-5 text-[#8e9cb2]">Capital and risk: $100,000 is the default for local simulation and a newly created Alpaca Paper account; the actual account equity appears after a successful broker connection. At 0.25% risk per trade, $250 is the estimated stop-loss risk budget (= $100,000 × 0.0025), not the trade size. Position size is also limited by stop distance and exposure caps.</p>
 
       <div className="grid grid-cols-1 gap-5 xl:grid-cols-[minmax(0,1.2fr)_minmax(360px,.8fr)]">
         <div className="flex flex-col gap-5">
@@ -231,12 +346,12 @@ export default function AgentDashboard() {
                       <span className="text-xs font-semibold text-[#e4ebf6]">{outcome.symbol}</span>
                       {outcome.side && <span className={`rounded px-1.5 py-0.5 text-[10px] uppercase ${outcome.side === "long" ? "bg-[#143a30] text-[#8ee9c4]" : "bg-[#3a242b] text-[#ffb0ba]"}`}>{outcome.side}</span>}
                       <span className={`rounded px-1.5 py-0.5 text-[10px] font-semibold uppercase ${outcome.status === "opened" ? "bg-[#143a30] text-[#8ee9c4]" : outcome.status === "skipped" ? "bg-amber-950/50 text-amber-200" : "bg-[#1a2637] text-[#a8b5c8]"}`}>{outcome.status === "opened" ? "Paper position opened" : outcome.status === "no_trade" ? "No trade" : outcome.status}</span>
-                      {outcome.quantity && outcome.simulated_price && <span className="text-[10px] text-[#8e9cb2]">{outcome.quantity} shares · simulated {money(outcome.simulated_price)}</span>}
+                      {outcome.quantity && outcome.simulated_price && <span className="text-[10px] text-[#8e9cb2]">{outcome.quantity} shares · {outcome.execution_mode === "alpaca_paper" ? "Alpaca Paper fill" : "local simulated fill"} {money(outcome.simulated_price)}</span>}
                     </div>
                     {outcome.reason && <p className="text-xs leading-5 text-[#8e9cb2]">{outcome.reason}</p>}
                   </div>)}
                 </div>
-                <p className="mt-3 text-[10px] leading-4 text-[#71819a]">Only entries listed as “Paper position opened” were created. AI suggestions alone are not fills. Everything shown here is simulated.</p>
+                <p className="mt-3 text-[10px] leading-4 text-[#71819a]">Only entries listed as “Paper position opened” were executed. Local simulations stay in SQLite; Alpaca Paper fills appear in the Alpaca simulated account. No live orders are sent.</p>
               </> : <p className="text-xs leading-5 text-[#8e9cb2]">{latestScanAttempt?.status === "failed" ? `The latest market scan failed: ${latestScanAttempt.error ?? "check the backend terminal for details"}` : "Waiting for a completed autonomous scan with an execution summary. The raw AI answer alone does not prove a paper trade was opened."}</p>}
             </div>}
             {latestResponse && <div className="mt-5 rounded-xl border border-[#29384d] bg-[#0a1220] p-4">
@@ -273,16 +388,38 @@ export default function AgentDashboard() {
           </Panel>
 
           <Panel className="p-5">
-            <SectionTitle icon={Wallet} title="Open paper positions" note="Simulated only"/>
+            <SectionTitle icon={Wallet} title={brokerMode ? "Open Alpaca Paper positions" : "Open local simulation positions"} note={brokerMode ? "Broker-reported account" : "SQLite only · not sent to Alpaca"}/>
             <div className="mt-4 overflow-x-auto">
               <table className="w-full min-w-[800px] text-left text-xs">
-                <thead className="text-[#71819a]"><tr className="border-b border-[#263449]"><th className="pb-3 font-medium">Symbol</th><th className="pb-3 font-medium">Side / Qty</th><th className="pb-3 font-medium">Entry</th><th className="pb-3 font-medium">Mark</th><th className="pb-3 font-medium">Stop / Target</th><th className="pb-3 font-medium">Manage</th></tr></thead>
-                <tbody>{(portfolio?.open_positions ?? []).map(pos => <tr key={pos.id} className="border-b border-[#1f2b3d] last:border-0"><td className="py-3 font-semibold">{pos.symbol}</td><td className="py-3 capitalize">{pos.side} / {pos.quantity}</td><td className="py-3">{money(pos.entry_price)}</td><td className="py-3">{money(pos.current_price)}</td><td className="py-3">{money(pos.stop_loss)} / {money(pos.take_profit)}</td><td className="py-3"><PositionActions position={pos} onChanged={() => void refresh()}/></td></tr>)}
-                  {(portfolio?.open_positions ?? []).length === 0 && <tr><td colSpan={5} className="py-6 text-center text-[#71819a]">No open paper positions yet.</td></tr>}
+                <thead className="text-[#71819a]"><tr className="border-b border-[#263449]"><th className="pb-3 font-medium">Symbol</th><th className="pb-3 font-medium">Side / Qty</th><th className="pb-3 font-medium">Entry</th><th className="pb-3 font-medium">Mark</th><th className="pb-3 font-medium">Stop / Target</th><th className="pb-3 font-medium">Execution</th><th className="pb-3 font-medium">Manage</th></tr></thead>
+                <tbody>{(portfolio?.open_positions ?? []).map(pos => <tr key={pos.id} className="border-b border-[#1f2b3d] last:border-0"><td className="py-3 font-semibold">{pos.symbol}</td><td className="py-3 capitalize">{pos.side} / {pos.quantity}</td><td className="py-3">{money(pos.entry_price)}</td><td className="py-3">{money(pos.current_price)}</td><td className="py-3">{money(pos.stop_loss)} / {money(pos.take_profit)}</td><td className="py-3">{pos.execution_mode === "alpaca_paper" ? "Alpaca Paper" : "Local simulation"}</td><td className="py-3"><PositionActions position={pos} onChanged={() => void refresh()}/></td></tr>)}
+                  {(portfolio?.open_positions ?? []).length === 0 && <tr><td colSpan={7} className="py-6 text-center text-[#71819a]">{brokerMode ? "No Alpaca Paper positions are currently tracked." : "No local simulation positions are open."}</td></tr>}
                 </tbody>
               </table>
             </div>
           </Panel>
+          {brokerOfflinePositions.length > 0 && <Panel className="p-5">
+            <SectionTitle icon={CircleAlert} title="Alpaca positions pending reconciliation" note="Broker connection required"/>
+            <p className="mt-2 text-xs leading-5 text-amber-100">These positions were created through Alpaca Paper, but the broker API is currently unavailable or their current state could not be confirmed. Do not close them at a local mark. Reconnect Alpaca and confirm broker status first.</p>
+            <div className="mt-4 space-y-2">{brokerOfflinePositions.map(pos => <div key={pos.id} className="rounded-lg border border-[#2b3c54] bg-[#0a1220] p-3 text-xs"><strong>{pos.symbol} · {pos.side.toUpperCase()} · {pos.quantity} shares</strong><p className="mt-1 text-[#a8b5c8]">Recorded entry {money(pos.entry_price)} · last stored mark {money(pos.current_price)} · stop {money(pos.stop_loss)} · target {money(pos.take_profit)}</p></div>)}</div>
+          </Panel>}
+          {brokerMode && (portfolio?.broker_positions?.length ?? 0) > 0 && <Panel className="p-5">
+            <SectionTitle icon={Activity} title="Actual Alpaca Paper account positions" note="Broker API"/>
+            <p className="mt-2 text-xs leading-5 text-[#8e9cb2]">These rows come directly from Alpaca&apos;s Paper account. Any “broker-only” or mismatched position must be reconciled before this app can open another Alpaca Paper trade. They are never silently copied into the local ledger.</p>
+            <div className="mt-4 overflow-x-auto"><table className="w-full min-w-[500px] text-left text-xs">
+              <thead className="text-[#71819a]"><tr className="border-b border-[#263449]"><th className="pb-2">Symbol</th><th className="pb-2">Side / Qty</th><th className="pb-2">Avg entry</th><th className="pb-2">Current</th><th className="pb-2">Unrealized P&amp;L</th></tr></thead>
+              <tbody>{(portfolio?.broker_positions ?? []).map((bp, index) => <tr key={`${bp.symbol}-${index}`} className="border-b border-[#1f2b3d] last:border-0"><td className="py-2 font-semibold">{bp.symbol}</td><td className="py-2 capitalize">{bp.side ?? "—"} / {bp.qty ?? "—"}</td><td className="py-2">{bp.avg_entry_price ? money(Number(bp.avg_entry_price)) : "—"}</td><td className="py-2">{bp.current_price ? money(Number(bp.current_price)) : "—"}</td><td className="py-2">{bp.unrealized_pl ? money(Number(bp.unrealized_pl)) : "$0.00"}</td></tr>)}</tbody>
+            </table></div>
+          </Panel>}
+          {localOnlyPositions.length > 0 && <Panel className="p-5">
+            <SectionTitle icon={CircleAlert} title="Legacy local-only positions" note="Not in Alpaca"/>
+            <p className="mt-2 text-xs leading-5 text-amber-100">These rows are local simulations from before Alpaca Paper routing was enabled. They are not broker holdings and are excluded from Alpaca equity/P&L. Review each before using “Close at mark”; that closes only the local simulation.</p>
+            <div className="mt-4 space-y-3">{localOnlyPositions.map(pos => <div key={pos.id} className="rounded-xl border border-[#2b3c54] bg-[#0a1220] p-3">
+              <div className="mb-3 flex flex-wrap items-center justify-between gap-2"><div className="text-sm font-semibold">{pos.symbol} · {pos.side.toUpperCase()} · {pos.quantity} shares</div><span className="rounded border border-amber-700/60 px-2 py-1 text-[10px] text-amber-100">LOCAL ONLY</span></div>
+              <div className="grid grid-cols-2 gap-2 text-xs text-[#a8b5c8] sm:grid-cols-4"><div>Entry <strong>{money(pos.entry_price)}</strong></div><div>Mark <strong>{money(pos.current_price)}</strong></div><div>Stop <strong>{money(pos.stop_loss)}</strong></div><div>Target <strong>{money(pos.take_profit)}</strong></div></div>
+              <div className="mt-3"><PositionActions position={pos} onChanged={() => void refresh()}/></div>
+            </div>)}</div>
+          </Panel>}
         </div>
 
         <div className="flex flex-col gap-5">
@@ -293,6 +430,8 @@ export default function AgentDashboard() {
                 ["Backend", health?.status === "ok" ? "Online" : "Connecting", health?.status === "ok"],
                 ["Local model", localModel ?? (inference?.selected_mode === "hosted" ? "Hosted fallback" : "Not detected"), Boolean(inference?.local_available)],
                 ["Market data credentials", market?.provider_configured ? "Configured" : "Not configured", Boolean(market?.provider_configured)],
+                ["Order execution", execution?.mode === "alpaca_paper" ? (execution.connected ? "Alpaca Paper account" : "Alpaca Paper configured but offline") : "Local simulation only", execution?.mode !== "alpaca_paper" || Boolean(execution.connected)],
+                ["Broker reconciliation", execution?.mode !== "alpaca_paper" ? "Not applicable in local mode" : execution.reconciled ? "Matched" : "Blocked: review issues above", execution?.mode !== "alpaca_paper" || Boolean(execution.reconciled)],
                 ["Market session", market?.regular_us_session ? "Regular session" : "Outside regular hours", Boolean(market?.regular_us_session)],
                 ["AI generation budget", inference?.max_output_tokens != null
                   ? `${inference.max_output_tokens.toLocaleString()} max output · ${inference.reasoning_budget_tokens?.toLocaleString() ?? "—"} reasoning · ${inference.request_timeout_seconds ?? "—"}s timeout`
@@ -307,7 +446,7 @@ export default function AgentDashboard() {
                 <li className="flex gap-2"><Check size={13} className="shrink-0 text-[#75e0b2]"/>{market?.autonomous_paper_trading_enabled
                   ? "Automated entries still require backend risk checks; manual proposals require approval"
                   : "New positions require explicit manual approval"}</li>
-                <li className="flex gap-2"><Check size={13} className="shrink-0 text-[#75e0b2]"/> Live order execution is not implemented</li>
+                <li className="flex gap-2"><Check size={13} className="shrink-0 text-[#75e0b2]"/> Live orders are never supported; broker mode can target Alpaca Paper only</li>
                 <li className="flex gap-2"><Check size={13} className="shrink-0 text-[#75e0b2]"/> Strategy promotion is manual only</li>
               </ul>
             </div>

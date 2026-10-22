@@ -66,9 +66,25 @@ class Database:
                     status TEXT NOT NULL, opened_at TEXT NOT NULL, closed_at TEXT,
                     realized_pnl REAL NOT NULL DEFAULT 0,
                     timeframe TEXT NOT NULL DEFAULT 'intraday',
-                    last_processed_bar_at TEXT
+                    last_processed_bar_at TEXT,
+                    execution_mode TEXT NOT NULL DEFAULT 'local_simulation'
                 );
                 CREATE INDEX IF NOT EXISTS ix_positions_status ON positions(status);
+                CREATE TABLE IF NOT EXISTS broker_order_intents (
+                    proposal_id TEXT PRIMARY KEY, proposal_version INTEGER NOT NULL,
+                    client_order_id TEXT NOT NULL UNIQUE, symbol TEXT NOT NULL,
+                    status TEXT NOT NULL, broker_order_id TEXT, last_error TEXT,
+                    created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS ix_broker_order_intents_status
+                    ON broker_order_intents(status, updated_at);
+                CREATE TABLE IF NOT EXISTS broker_close_intents (
+                    position_id TEXT PRIMARY KEY, symbol TEXT NOT NULL,
+                    status TEXT NOT NULL, broker_order_id TEXT, last_error TEXT,
+                    created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS ix_broker_close_intents_status
+                    ON broker_close_intents(status, updated_at);
                 CREATE TABLE IF NOT EXISTS watchlist (
                     symbol TEXT PRIMARY KEY, enabled INTEGER NOT NULL DEFAULT 1,
                     created_at TEXT NOT NULL
@@ -101,6 +117,10 @@ class Database:
             if "last_processed_bar_at" not in position_columns:
                 conn.execute(
                     "ALTER TABLE positions ADD COLUMN last_processed_bar_at TEXT"
+                )
+            if "execution_mode" not in position_columns:
+                conn.execute(
+                    "ALTER TABLE positions ADD COLUMN execution_mode TEXT NOT NULL DEFAULT 'local_simulation'"
                 )
             legacy_positions = conn.execute(
                 "SELECT p.id, pr.body_json FROM positions p "
@@ -254,11 +274,12 @@ class Database:
             raise ValueError("Unsupported position timeframe.")
         with self.connect() as conn:
             rows = conn.execute(
-                "SELECT symbol, COALESCE(last_processed_bar_at, opened_at) AS start_time "
+                "SELECT symbol, execution_mode, COALESCE(last_processed_bar_at, opened_at) AS start_time "
                 "FROM positions WHERE status='open' AND timeframe=? ORDER BY symbol",
                 (timeframe,),
             ).fetchall()
-            return [{"symbol": row["symbol"], "start_time": row["start_time"]} for row in rows]
+            return [{"symbol": row["symbol"], "start_time": row["start_time"],
+                     "execution_mode": row["execution_mode"]} for row in rows]
 
     def list_open_position_symbols(self, timeframe: str | None = None) -> list[str]:
         with self.connect() as conn:
@@ -369,7 +390,8 @@ class Database:
     def approve_paper_trade(
         self, proposal_id: str, version: int, quantity: int, max_open_positions: int,
         max_exposure_value: float, *, simulated_fill_price: float | None = None,
-        slippage_bps: float = 0.0,
+        slippage_bps: float = 0.0, execution_mode: str = "local_simulation",
+        broker_order_id: str | None = None,
     ) -> dict[str, Any]:
         now = utc_now()
         with self.connect() as conn:
@@ -405,14 +427,27 @@ class Database:
                 conn.rollback()
                 raise ValueError("Exposure limit would be exceeded.")
             order_id, position_id = new_id("ord"), new_id("pos")
+            if execution_mode not in {"local_simulation", "alpaca_paper"}:
+                conn.rollback()
+                raise ValueError("Unsupported paper execution mode.")
             details = {
                 "proposal_id": proposal_id,
                 "proposal_version": version,
                 "requested_entry_price": float(body["entry_price"]),
-                "simulated_fill_price": fill_price,
-                "fill_source": "latest_server_stored_bar_close_with_adverse_slippage",
+                "fill_price": fill_price,
+                "execution_mode": execution_mode,
+                "broker_order_id": broker_order_id,
+                "fill_source": (
+                    "alpaca_paper_broker_confirmed_fill"
+                    if execution_mode == "alpaca_paper"
+                    else "latest_server_stored_bar_close_with_adverse_slippage"
+                ),
                 "slippage_bps": float(slippage_bps),
-                "note": "Paper-only fill simulation; not a real market or broker fill.",
+                "note": (
+                    "Alpaca Paper Trading simulated brokerage fill."
+                    if execution_mode == "alpaca_paper"
+                    else "Local paper simulation; not a broker order or fill."
+                ),
             }
             conn.execute(
                 "INSERT INTO orders(id,proposal_id,symbol,side,quantity,status,simulated_price,created_at,details_json) "
@@ -422,11 +457,11 @@ class Database:
             )
             conn.execute(
                 "INSERT INTO positions(id,proposal_id,symbol,side,quantity,entry_price,current_price,"
-                "stop_loss,take_profit,status,opened_at,timeframe) "
-                "VALUES (?,?,?,?,?,?,?,?,?,'open',?,?)",
+                "stop_loss,take_profit,status,opened_at,timeframe,execution_mode) "
+                "VALUES (?,?,?,?,?,?,?,?,?,'open',?,?,?)",
                 (position_id, proposal_id, body["symbol"], body["side"], quantity,
                  fill_price, fill_price, body["stop_loss"], body["take_profit"], now,
-                 body.get("timeframe", "intraday")),
+                 body.get("timeframe", "intraday"), execution_mode),
             )
             conn.execute(
                 "UPDATE proposals SET status='approved',updated_at=? WHERE id=?",
@@ -434,9 +469,233 @@ class Database:
             )
             conn.commit()
             return {"order_id": order_id, "position_id": position_id, "status": "filled",
-                    "mode": "paper", "quantity": quantity, "simulated_price": fill_price,
+                    "mode": "alpaca_paper" if execution_mode == "alpaca_paper" else "paper",
+                    "execution_mode": execution_mode, "quantity": quantity,
+                    "simulated_price": fill_price, "fill_price": fill_price,
+                    "broker_order_id": broker_order_id,
                     "requested_entry_price": float(body["entry_price"]),
                     "slippage_bps": float(slippage_bps)}
+
+    def register_broker_order_intent(
+        self, proposal_id: str, version: int, client_order_id: str, symbol: str
+    ) -> dict[str, Any]:
+        """Durably record submission intent before contacting Alpaca."""
+        if not client_order_id.strip() or not symbol.strip():
+            raise ValueError("Broker submission requires a client order ID and symbol.")
+        now = utc_now()
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            proposal = conn.execute(
+                "SELECT version,status FROM proposals WHERE id=?", (proposal_id,)
+            ).fetchone()
+            if proposal is None:
+                conn.rollback()
+                raise KeyError("Proposal not found.")
+            if proposal["version"] != version or proposal["status"] != "pending":
+                conn.rollback()
+                raise ValueError("Proposal is stale, already reviewed, or not pending.")
+            existing = conn.execute(
+                "SELECT * FROM broker_order_intents WHERE proposal_id=?", (proposal_id,)
+            ).fetchone()
+            if existing is not None:
+                if existing["client_order_id"] != client_order_id:
+                    conn.rollback()
+                    raise ValueError("Proposal already has a different broker order intent.")
+                if existing["status"] in {"failed", "resolved_no_order"}:
+                    conn.execute(
+                        "UPDATE broker_order_intents SET status='submitting',last_error=NULL,updated_at=? "
+                        "WHERE proposal_id=?",
+                        (now, proposal_id),
+                    )
+                    existing = conn.execute(
+                        "SELECT * FROM broker_order_intents WHERE proposal_id=?", (proposal_id,)
+                    ).fetchone()
+                conn.commit()
+                return dict(existing)
+            conn.execute(
+                "INSERT INTO broker_order_intents(proposal_id,proposal_version,client_order_id,"
+                "symbol,status,created_at,updated_at) VALUES (?,?,?,?, 'submitting',?,?)",
+                (proposal_id, version, client_order_id, symbol.upper(), now, now),
+            )
+            conn.commit()
+            row = conn.execute(
+                "SELECT * FROM broker_order_intents WHERE proposal_id=?", (proposal_id,)
+            ).fetchone()
+            return dict(row)
+
+    def update_broker_order_intent(
+        self, proposal_id: str, status: str, *,
+        broker_order_id: str | None = None, last_error: str | None = None,
+    ) -> None:
+        allowed = {"submitting", "unknown", "recorded", "recovered", "rejected", "failed", "resolved_no_order"}
+        if status not in allowed:
+            raise ValueError("Unsupported broker order intent status.")
+        with self.connect() as conn:
+            conn.execute(
+                "UPDATE broker_order_intents SET status=?, "
+                "broker_order_id=COALESCE(?,broker_order_id), last_error=?, updated_at=? "
+                "WHERE proposal_id=?",
+                (status, broker_order_id, last_error[:500] if last_error else None,
+                 utc_now(), proposal_id),
+            )
+
+    def register_broker_close_intent(self, position_id: str, symbol: str) -> dict[str, Any]:
+        """Persist a close intent before a DELETE /positions request."""
+        now = utc_now()
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            position = conn.execute(
+                "SELECT status,execution_mode,symbol FROM positions WHERE id=?", (position_id,)
+            ).fetchone()
+            if position is None:
+                conn.rollback()
+                raise KeyError("Position not found.")
+            if position["status"] != "open" or position["execution_mode"] != "alpaca_paper":
+                conn.rollback()
+                raise ValueError("Only an open Alpaca Paper position can create a broker close intent.")
+            if str(position["symbol"]).upper() != symbol.upper():
+                conn.rollback()
+                raise ValueError("Close-intent symbol does not match the local broker position.")
+            existing = conn.execute(
+                "SELECT * FROM broker_close_intents WHERE position_id=?", (position_id,)
+            ).fetchone()
+            if existing is not None:
+                if existing["status"] in {"submitting", "unknown"}:
+                    conn.rollback()
+                    raise ValueError(
+                        "A prior Alpaca Paper close has an unresolved result. Check Alpaca Orders "
+                        "before attempting another close."
+                    )
+                if existing["status"] in {"failed", "resolved_no_order"}:
+                    conn.execute(
+                        "UPDATE broker_close_intents SET status='submitting',broker_order_id=NULL,"
+                        "last_error=NULL,created_at=?,updated_at=? WHERE position_id=?",
+                        (now, now, position_id),
+                    )
+                else:
+                    conn.rollback()
+                    raise ValueError(
+                        f"Close-intent status is {existing['status']!r}; review broker state before retrying."
+                    )
+            else:
+                conn.execute(
+                    "INSERT INTO broker_close_intents(position_id,symbol,status,created_at,updated_at) "
+                    "VALUES (?,?, 'submitting',?,?)",
+                    (position_id, symbol.upper(), now, now),
+                )
+            conn.commit()
+            return dict(conn.execute(
+                "SELECT * FROM broker_close_intents WHERE position_id=?", (position_id,)
+            ).fetchone())
+
+    def update_broker_close_intent(
+        self, position_id: str, status: str, *,
+        broker_order_id: str | None = None, last_error: str | None = None,
+    ) -> None:
+        allowed = {
+            "submitting", "unknown", "recorded", "failed", "resolved_no_order",
+        }
+        if status not in allowed:
+            raise ValueError("Unsupported broker close-intent status.")
+        with self.connect() as conn:
+            conn.execute(
+                "UPDATE broker_close_intents SET status=?, "
+                "broker_order_id=COALESCE(?,broker_order_id), last_error=?, updated_at=? "
+                "WHERE position_id=?",
+                (status, broker_order_id, last_error[:500] if last_error else None,
+                 utc_now(), position_id),
+            )
+
+    def record_recovered_alpaca_paper_trade(
+        self, proposal_id: str, version: int, quantity: int, fill_price: float,
+        broker_order_id: str,
+    ) -> dict[str, Any]:
+        """Reconcile a confirmed broker fill that occurred before its local commit.
+
+        This records an already-existing Alpaca Paper fill; it never submits an order.
+        """
+        if quantity < 1 or not isinstance(fill_price, (int, float)) or fill_price <= 0:
+            raise ValueError("Recovered Alpaca fill quantity and price must be positive.")
+        if not broker_order_id.strip():
+            raise ValueError("A broker order ID is required to recover a fill.")
+
+        now = utc_now()
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            proposal_row = conn.execute(
+                "SELECT * FROM proposals WHERE id=?", (proposal_id,)
+            ).fetchone()
+            if proposal_row is None:
+                conn.rollback()
+                raise KeyError("Proposal not found for recovered Alpaca fill.")
+            if proposal_row["version"] != version:
+                conn.rollback()
+                raise ValueError("Proposal version changed; recovered broker fill needs manual review.")
+            existing = conn.execute(
+                "SELECT * FROM positions WHERE proposal_id=?", (proposal_id,)
+            ).fetchone()
+            if existing is not None:
+                conn.commit()
+                return {"position_id": existing["id"], "status": existing["status"],
+                        "mode": "alpaca_paper", "already_recorded": True}
+            if proposal_row["status"] != "pending":
+                conn.rollback()
+                raise ValueError("Proposal is no longer pending; recovered fill needs manual review.")
+
+            body = json.loads(proposal_row["body_json"])
+            if body.get("timeframe", "intraday") != "intraday":
+                conn.rollback()
+                raise ValueError("Only intraday fills can be recovered automatically.")
+            conflict = conn.execute(
+                "SELECT id FROM positions WHERE symbol=? AND status='open'",
+                (str(body["symbol"]).upper(),),
+            ).fetchone()
+            if conflict is not None:
+                conn.rollback()
+                raise ValueError("An open local position conflicts with the recovered broker fill.")
+
+            order_id, position_id = new_id("ord"), new_id("pos")
+            details = {
+                "proposal_id": proposal_id,
+                "proposal_version": version,
+                "requested_entry_price": float(body["entry_price"]),
+                "fill_price": float(fill_price),
+                "execution_mode": "alpaca_paper",
+                "broker_order_id": broker_order_id,
+                "fill_source": "alpaca_paper_broker_confirmed_fill_recovered_after_ambiguous_response",
+                "recovered_after_ambiguous_response": True,
+                "note": "This records an existing Alpaca Paper fill; no new broker order was submitted.",
+            }
+            conn.execute(
+                "INSERT INTO orders(id,proposal_id,symbol,side,quantity,status,simulated_price,created_at,details_json) "
+                "VALUES (?,?,?,?,?,'filled',?,?,?)",
+                (order_id, proposal_id, body["symbol"], body["side"], quantity,
+                 float(fill_price), now, json.dumps(details)),
+            )
+            conn.execute(
+                "INSERT INTO positions(id,proposal_id,symbol,side,quantity,entry_price,current_price,"
+                "stop_loss,take_profit,status,opened_at,timeframe,execution_mode) "
+                "VALUES (?,?,?,?,?,?,?,?,?,'open',?,?,'alpaca_paper')",
+                (position_id, proposal_id, body["symbol"], body["side"], quantity,
+                 float(fill_price), float(fill_price), float(body["stop_loss"]),
+                 float(body["take_profit"]), now, "intraday"),
+            )
+            conn.execute(
+                "UPDATE proposals SET status='approved',updated_at=? WHERE id=?",
+                (now, proposal_id),
+            )
+            conn.execute(
+                "UPDATE broker_order_intents SET status='recovered',broker_order_id=?,"
+                "last_error=NULL,updated_at=? WHERE proposal_id=?",
+                (broker_order_id, now, proposal_id),
+            )
+            conn.commit()
+            return {
+                "order_id": order_id, "position_id": position_id, "status": "filled",
+                "mode": "alpaca_paper", "execution_mode": "alpaca_paper",
+                "quantity": quantity, "fill_price": float(fill_price),
+                "broker_order_id": broker_order_id, "recovered": True,
+            }
 
     def reject_proposal(self, proposal_id: str, version: int) -> dict[str, Any]:
         with self.connect() as conn:
@@ -462,8 +721,11 @@ class Database:
             ).fetchall()
             return [{**dict(r), "details": json.loads(r["details_json"])} for r in rows]
 
-    def close_position(self, position_id: str, exit_price: float | None = None) -> dict[str, Any]:
-        """Close a paper position; None means use the server-recorded mark, never a client price."""
+    def close_position(
+        self, position_id: str, exit_price: float | None = None, *,
+        pricing_method_override: str | None = None,
+    ) -> dict[str, Any]:
+        """Close a paper position; None uses the server mark, never a client-supplied price."""
         if exit_price is not None and (not isinstance(exit_price, (int, float)) or exit_price <= 0):
             raise ValueError("Exit price must be positive.")
         now = utc_now()
@@ -476,10 +738,10 @@ class Database:
             if row["status"] != "open":
                 conn.rollback()
                 raise ValueError("Position is already closed.")
-            pricing_method = "explicit_test_price"
+            pricing_method = pricing_method_override or "explicit_test_price"
             if exit_price is None:
                 exit_price = float(row["current_price"])
-                pricing_method = "last_recorded_server_mark"
+                pricing_method = pricing_method_override or "last_recorded_server_mark"
             sign = 1 if row["side"] == "long" else -1
             pnl = (float(exit_price) - row["entry_price"]) * row["quantity"] * sign
             bar_timeframe = "1Day" if row["timeframe"] == "swing" else "5Min"

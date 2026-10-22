@@ -1,46 +1,54 @@
-# Phase 1 Risk Policy
+# Intraday Paper Risk Policy
 
-This software is a research and simulation tool, not financial advice.
+This software is a research and simulation tool, not financial advice. New trade proposals are intraday-only. Legacy positions already in the database may still be reconciled or closed, but new swing entries are rejected.
 
 ## Required invariants
 
 - Paper trading is the only supported execution mode.
-- The application rejects configuration that enables live order endpoints.
-- Every new paper position requires explicit approval for the current proposal version.
+- The application rejects configuration that enables live order endpoints; broker execution is hard-wired to Alpaca Paper only.
+- Manual proposals require explicit approval for the current version. Autonomous entries may open without per-trade approval only after the same deterministic server-side risk checks.
 - The backend revalidates the proposal when approving it.
 - The proposal's quantity is not trusted; share quantity is calculated by deterministic code.
-- A model proposal is saved only if its symbol and timeframe match the request and its entry is within `MAX_ENTRY_DEVIATION_PCT` of the latest close it was given; otherwise the analysis job fails with a `ProposalMismatch` error and nothing is stored.
-- Approval freshness is judged against the data timeframe stamped by the server (`data_timeframe`), never the model's own `timeframe` field. Proposals without that stamp cannot be approved and must be regenerated.
-- Duplicate approvals and duplicate proposal executions are rejected by an atomic SQLite transaction.
+- A model proposal is saved only if its symbol and timeframe match the request and its entry is within MAX_ENTRY_DEVIATION_PCT of the latest close it was given; otherwise the job fails and nothing is stored.
+- Approval freshness is judged against the data timeframe stamped by the server, never the model's own timeframe field. Proposals without that stamp cannot be approved.
+- Duplicate approvals and duplicate proposal executions are rejected by an atomic SQLite transaction. Alpaca entry requests also use a stable client order ID so retries can look up an existing broker order instead of submitting another one.
 - Stale, malformed, or illogical prices are rejected.
 - Strategy changes remain experiments and are never automatically promoted.
 - Credentials must never appear in source code, prompts, browser bundles, logs, or Git.
-- State-changing API requests require a server-side local bearer token and trusted localhost origin. The token is stored in the ignored root `.env` and forwarded only by the Next.js server-side proxy; it is not a `NEXT_PUBLIC_*` variable.
+- State-changing API requests require a server-side local bearer token and trusted localhost origin. The token is stored in the ignored root .env and forwarded only by the Next.js server-side proxy.
+- When Alpaca Paper execution is enabled, broker/local positions must reconcile before new entries are allowed. Untracked broker positions or legacy local-only positions block new broker entries.
 
 ## Initial settings
 
-- Risk budget: 0.25% of simulated equity per trade.
+- Risk budget: 0.25% of the relevant account equity per trade.
 - Minimum reward-to-risk: 1.0.
-- Maximum entry deviation: 2% from the latest close (`MAX_ENTRY_DEVIATION_PCT`). At approval, the paper broker rechecks the latest stored bar, rejects an entry that has drifted beyond the configured deviation, and derives the simulated fill from that bar's close with adverse `SIMULATED_SLIPPAGE_BPS` applied.
-- Per-position allocation cap: `MAX_POSITION_VALUE_PCT` (default 10% of equity).
-- Aggregate gross paper exposure cap: `MAX_GROSS_EXPOSURE_PCT` (default 20% of equity).
+- Maximum entry deviation: 2% from the latest close (MAX_ENTRY_DEVIATION_PCT).
+- Per-position allocation cap: MAX_POSITION_VALUE_PCT (default 10% of equity).
+- Aggregate gross exposure cap: MAX_GROSS_EXPOSURE_PCT (default 20% of equity).
 - Maximum open paper positions: 5.
-- Daily loss guard: blocks new positions when current-day realized paper P&L plus current unrealized paper P&L reaches the configured threshold. Day boundaries are UTC in Phase 1.
+- Daily loss guard: blocks new entries when current New York calendar day's realized and unrealized P&L reaches the configured threshold. UTC midnight is not the US trading-day boundary.
 - Stop loss and take profit are required for a proposal.
-- These values are initial engineering defaults, not recommendations for live capital.
+- PAPER_INITIAL_EQUITY=100000 applies only to local simulation. In Alpaca Paper mode, account equity, cash, positions and broker marks come from the Alpaca account API.
+- These values are engineering defaults, not recommendations for real capital.
+
+## Why the risk budget is $250
+
+At $100,000 equity, a 0.25% risk budget is $100,000 × 0.0025 = $250. That is the estimated loss allowance if the stop is reached, not the amount invested in the shares. Quantity also has to fit the stop distance, the 10% position allocation limit, and the 20% aggregate gross exposure limit. With a $2 entry-to-stop distance, a $250 budget allows at most 125 shares before position/exposure caps and price/slippage effects.
 
 ## Quantity
 
-For one share of a long or short position:
+For a long or short position:
 
-`risk_per_share = abs(entry_price - stop_loss)`
+- risk per share = absolute value of entry price minus stop-loss price
+- risk budget = applicable account equity × risk percentage / 100
+- quantity by risk = floor(risk budget / risk per share)
 
-`risk_budget = paper_equity * risk_per_trade_pct / 100`
+The share quantity is independently constrained by the risk budget, per-position allocation cap and remaining gross exposure. The smallest valid quantity is used; if less than one share fits, the proposal is rejected. The app records the broker-confirmed average fill in Alpaca Paper mode and a computed adverse-slippage fill in local simulation. Market price movement can still make realized execution risk differ from the estimate.
 
-`quantity_by_risk = floor(risk_budget / risk_per_share)`
+## Execution modes and exits
 
-The share quantity is constrained independently by the risk budget, per-position allocation cap, and remaining aggregate gross exposure. The smallest valid quantity is used; if less than one share fits, the proposal is rejected. Risk is recalculated using the simulated fill price, not the model's requested entry.
+Local simulation mode writes fake fills and positions to SQLite only; they do not appear in Alpaca. Manual close uses the most recently stored local mark, and OHLC processing simulates stop/target exits only when the app fetches bars.
 
-## Simulation limitations
+Alpaca Paper mode submits an equity bracket order containing a market entry, take-profit limit order and stop-loss order. The API endpoint is hard-coded to the paper host. Alpaca Paper positions are reconciled against SQLite; broker-side bracket orders are the authority for exits and manual close is routed through Alpaca Paper with a confirmed fill price. Broker entry and close requests have durable intents. If a write result is ambiguous, the app must not book a stale local mark as the broker's fill or retry a close blindly. It checks recent broker orders and positions, keeps uncertain requests visibly pending, and only permits manual release after a 120-second wait, explicit confirmation and fresh broker API checks.
 
-Phase 1 simulates an immediate fill at the latest server-stored market-bar close plus adverse entry slippage. A manual close uses the server-recorded position mark; the browser cannot choose the price booked to P&L. Automatic exits process completed OHLC candles from a durable per-position checkpoint, using five-minute bars for intraday positions and completed daily bars for swing positions. When one candle crosses both stop and target without a resolving opening gap, the stop is assumed first. These are still simulations, not broker orders or execution guarantees. Exit checks run only when the application fetches market data; they cannot run while the app is offline. Partial fills, per-exit slippage, fees, borrow availability, short-sale constraints, options and exchange-specific order rules require more work before expanding instrument support.
+Alpaca Paper is still a simulation, not a live broker guarantee. It may differ from real execution due to market impact, queue position, slippage, fees, borrow availability and other factors. The session gate excludes weekends and out-of-hours but does not yet use an authoritative holiday/early-close calendar. The app cannot monitor/close positions when it is shut down. Live trading and options are not supported.

@@ -9,7 +9,7 @@ class ChatRequest(BaseModel):
 
 class AnalyzeRequest(BaseModel):
     symbol: str = Field(min_length=1, max_length=12)
-    timeframe: Literal["intraday", "swing"] = "intraday"
+    timeframe: Literal["intraday"] = "intraday"
 
 
 class WatchlistRequest(BaseModel):
@@ -74,3 +74,16 @@ class JobResponse(BaseModel):
     id: str
     task: str
     status: str
+
+
+
+class ResolveBrokerIntentRequest(BaseModel):
+    # This is deliberately explicit: recovery is allowed only after the operator
+    # has checked both the Alpaca Paper order list and its positions.
+    confirm_no_order_and_no_position: Literal[True]
+
+
+
+class ResolveBrokerCloseRequest(BaseModel):
+    # Confirm that the Alpaca Paper position is still open and no close order exists.
+    confirm_no_close_order_and_position_open: Literal[True]

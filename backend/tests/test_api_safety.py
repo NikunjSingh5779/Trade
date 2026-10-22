@@ -69,6 +69,7 @@ def test_close_endpoint_ignores_client_supplied_exit_price(monkeypatch, tmp_path
     test_db = _db_with_open_position(tmp_path / "api.db")
     headers = _auth(monkeypatch)
     monkeypatch.setattr(main, "db", test_db)
+    monkeypatch.setattr(main, "paper_broker", main.PaperBroker(main.settings, test_db))
 
     response = TestClient(main.app).post(
         "/api/positions/pos-api/close",

@@ -8,7 +8,8 @@ from app.config import Settings
 from app.market_data.alpaca import AlpacaMarketData
 from app.market_data.feeds import ConfiguredFeedService
 from app.market_data.freshness import MarketDataFreshnessError, ensure_fresh_bars
-from app.market_data.sessions import current_scan_window, is_regular_us_bar, is_regular_us_session
+from app.market_data.sessions import current_scan_window, is_regular_us_bar, is_regular_us_session, us_session_bounds
+from app.execution.paper_broker import PaperBroker
 from app.storage import Database
 
 
@@ -45,26 +46,34 @@ def is_completed_market_bar(
 
 
 class MarketMonitor:
-    def __init__(self, settings: Settings, db: Database, provider: AlpacaMarketData, feeds: ConfiguredFeedService):
+    def __init__(
+        self, settings: Settings, db: Database, provider: AlpacaMarketData,
+        feeds: ConfiguredFeedService, paper_broker: PaperBroker | None = None,
+    ):
         self.settings = settings
         self.db = db
         self.provider = provider
         self.feeds = feeds
+        self.paper_broker = paper_broker
         self._stop = asyncio.Event()
 
     async def run_forever(self) -> None:
         while not self._stop.is_set():
-            regular_session = is_regular_us_session()
+            current = datetime.now(UTC)
+            regular_session = is_regular_us_session(current)
+            session = us_session_bounds(current.astimezone(_US_EASTERN).date())
             try:
-                # First recover any position carried across a prior session because the
-                # app was offline; same-day positions are left untouched before 16:00 ET.
-                await self.close_intraday_positions_after_session()
+                # Broker-backed entries are flattened during the final five minutes so
+                # market-close orders are submitted while regular trading is still open.
+                await self.close_intraday_positions_after_session(current)
                 if regular_session:
                     await self.run_once()
             except Exception as exc:
                 self.db.add_audit("market_scan.failed", {"error_type": type(exc).__name__})
-            eastern_clock = datetime.now(_US_EASTERN).time().replace(tzinfo=None)
-            near_close = regular_session and eastern_clock >= time(15, 55)
+            near_close = bool(
+                regular_session and session
+                and current >= session[1] - timedelta(minutes=5)
+            )
             timeout = (
                 60
                 if not regular_session or near_close
@@ -91,6 +100,13 @@ class MarketMonitor:
             current = current.replace(tzinfo=UTC)
         current = current.astimezone(UTC)
         eastern_now = current.astimezone(_US_EASTERN)
+        if self.settings.alpaca_paper_trading_enabled and self.paper_broker is not None:
+            try:
+                self.paper_broker.sync_broker_positions()
+            except Exception as exc:
+                self.db.add_audit("alpaca_paper.position_sync_failed", {
+                    "reason": "session_close", "error_type": type(exc).__name__,
+                })
         portfolio = self.db.portfolio_snapshot(self.settings.paper_initial_equity)
         closed: list[dict[str, Any]] = []
 
@@ -110,20 +126,53 @@ class MarketMonitor:
                 })
                 continue
 
-            # A position opened today stays open during regular hours. Any intraday
-            # position from an earlier date is overdue and is flattened on recovery.
-            due = (
-                opened_local.date() < eastern_now.date()
-                or (
-                    eastern_now.weekday() < 5
-                    and eastern_now.time().replace(tzinfo=None) >= time(16, 0)
-                    and opened_local.date() == eastern_now.date()
+            # Broker-backed positions are closed before the scheduled session end
+            # while market orders can still fill; local simulations use the scheduled close.
+            session = us_session_bounds(eastern_now.date())
+            if opened_local.date() < eastern_now.date():
+                due = True
+            elif opened_local.date() == eastern_now.date() and session:
+                due_at = (
+                    session[1] - timedelta(minutes=5)
+                    if position.get("execution_mode") == "alpaca_paper"
+                    else session[1]
                 )
-            )
+                due = current >= due_at
+            else:
+                due = False
             if not due:
                 continue
 
+            if position.get("execution_mode") == "alpaca_paper":
+                # Never send a market close while the regular session is shut; an off-hours
+                # day order could be queued for the next session rather than flattening now.
+                if not is_regular_us_session(current):
+                    continue
+                # Alpaca's attached bracket orders own stop/target exits. Close through
+                # the paper Trading API, never at a stale local mark.
+                if self.paper_broker is None:
+                    self.db.add_audit("paper_position.session_close_skipped", {
+                        "position_id": position["id"], "reason": "paper_broker_not_available",
+                    })
+                    continue
+                try:
+                    result = self.paper_broker.close_position(
+                        str(position["id"]), reason="us_regular_session_close"
+                    )
+                    event = {
+                        **result, "symbol": position["symbol"],
+                        "closed_at_check": current.isoformat(), "mode": "alpaca_paper",
+                    }
+                    closed.append(event)
+                except Exception as exc:
+                    self.db.add_audit("paper_position.session_close_skipped", {
+                        "position_id": position["id"], "symbol": position["symbol"],
+                        "reason": "broker_close_not_confirmed", "error_type": type(exc).__name__,
+                    })
+                continue
+
             checkpoint = position.get("last_processed_bar_at") or position["opened_at"]
+            final_bars: list[dict[str, Any]] = []
             try:
                 start_time = datetime.fromisoformat(str(checkpoint).replace("Z", "+00:00"))
                 if start_time.tzinfo is None:
@@ -142,46 +191,110 @@ class MarketMonitor:
                 for bar in final_bars:
                     if not is_completed_market_bar(bar, "intraday", current):
                         continue
-                    try:
-                        stamp = datetime.fromisoformat(
-                            str(bar["timestamp"]).replace("Z", "+00:00")
-                        )
-                    except (KeyError, TypeError, ValueError):
-                        continue
-                    if stamp.tzinfo is None:
-                        stamp = stamp.replace(tzinfo=UTC)
                     if not is_regular_us_bar(bar):
                         continue
                     for event in self.db.process_position_bar(bar, timeframe="intraday"):
                         self.db.add_audit("paper_position.auto_exit", event)
             except Exception as exc:
-                # Still flatten overdue paper positions with the last server-recorded mark;
-                # the audit trail makes any failed final-bar refresh explicit.
                 self.db.add_audit("paper_position.session_close_mark_refresh_failed", {
                     "position_id": position["id"],
                     "symbol": position["symbol"],
                     "error_type": type(exc).__name__,
                 })
 
+            # A local simulation must not book an old mark as though it were the
+            # session-close fill. Accept only an actual final five-minute candle
+            # (timestamped 5 min before the official NYSE close), from Alpaca data.
             try:
-                result = self.db.close_position(position["id"], None)
+                stored_bars = self.db.get_bars(
+                    position["symbol"], limit=500, timeframe="5Min"
+                )
+                candidates = sorted(
+                    [*stored_bars, *final_bars],
+                    key=lambda bar: str(bar.get("timestamp", "")),
+                )
+                verified_close_bar: dict[str, Any] | None = None
+                verified_close_stamp: datetime | None = None
+                for bar in candidates:
+                    if not is_completed_market_bar(bar, "intraday", current):
+                        continue
+                    if not is_regular_us_bar(bar):
+                        continue
+                    try:
+                        stamp = datetime.fromisoformat(
+                            str(bar["timestamp"]).replace("Z", "+00:00")
+                        )
+                        if stamp.tzinfo is None:
+                            stamp = stamp.replace(tzinfo=UTC)
+                        stamp = stamp.astimezone(UTC)
+                        bounds = us_session_bounds(stamp.astimezone(_US_EASTERN).date())
+                        close_price = float(bar["close"])
+                    except (KeyError, TypeError, ValueError):
+                        continue
+                    if (
+                        stamp <= opened_at.astimezone(UTC)
+                        or bounds is None
+                        or stamp < bounds[1] - timedelta(minutes=5)
+                        or stamp >= bounds[1]
+                        or bounds[1] > current
+                        or close_price <= 0
+                    ):
+                        continue
+                    # When recovering multiple missed sessions, flatten at the first
+                    # verified session close after entry, not a later date's stale/future close.
+                    if verified_close_stamp is None or stamp < verified_close_stamp:
+                        verified_close_bar = bar
+                        verified_close_stamp = stamp
+
+                with self.db.connect() as conn:
+                    state = conn.execute(
+                        "SELECT status FROM positions WHERE id=?", (position["id"],)
+                    ).fetchone()
+                if state is None or state["status"] != "open":
+                    # Stop/target already closed the position while processing candles.
+                    continue
+                if verified_close_bar is None:
+                    self.db.add_audit("paper_position.session_close_skipped", {
+                        "position_id": position["id"],
+                        "symbol": position["symbol"],
+                        "reason": "verified_final_regular_session_candle_unavailable",
+                    })
+                    continue
+
+                final_close_price = float(verified_close_bar["close"])
+                result = self.db.close_position(
+                    position["id"], final_close_price,
+                    pricing_method_override="last_verified_regular_session_close",
+                )
                 event = {
                     **result,
                     "symbol": position["symbol"],
                     "reason": "us_regular_session_close",
-                    "mark_source": result.get("pricing_method"),
+                    "mark_source": "alpaca_completed_final_five_minute_candle",
+                    "final_bar_timestamp": verified_close_bar["timestamp"],
                     "closed_at_check": current.isoformat(),
                     "mode": "paper",
                 }
                 self.db.add_audit("paper_position.session_close", event)
                 closed.append(event)
-            except (KeyError, ValueError) as exc:
+            except Exception as exc:
                 self.db.add_audit("paper_position.session_close_skipped", {
-                    "position_id": position["id"], "error_type": type(exc).__name__,
+                    "position_id": position["id"],
+                    "symbol": position["symbol"],
+                    "reason": "session_close_mark_not_verified",
+                    "error_type": type(exc).__name__,
                 })
         return closed
 
     async def run_once(self) -> dict[str, Any]:
+        if self.settings.alpaca_paper_trading_enabled and self.paper_broker is not None:
+            try:
+                self.paper_broker.sync_broker_positions()
+            except Exception as exc:
+                self.db.add_audit("alpaca_paper.position_sync_failed", {
+                    "reason": "market_scan", "error_type": type(exc).__name__,
+                })
+
         symbols = (
             self.settings.autonomous_symbol_list
             if self.settings.autonomous_paper_trading_enabled
@@ -203,6 +316,9 @@ class MarketMonitor:
             checkpoints = self.db.list_open_position_backfill_starts(position_horizon)
             for checkpoint in checkpoints:
                 symbol = checkpoint["symbol"]
+                if checkpoint.get("execution_mode") == "alpaca_paper":
+                    # Broker-backed bracket orders are the only authority for exits.
+                    continue
                 try:
                     start_time = datetime.fromisoformat(
                         checkpoint["start_time"].replace("Z", "+00:00")

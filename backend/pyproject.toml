@@ -16,6 +16,7 @@ dependencies = [
   "portalocker>=2.10,<4.0",
   "numpy>=1.26,<3.0",
   "pandas>=2.2,<4.0",
+  "pandas-market-calendars>=5.4,<6.0",
 ]
 
 [project.optional-dependencies]

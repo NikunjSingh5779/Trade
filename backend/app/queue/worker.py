@@ -7,6 +7,7 @@ from pydantic import ValidationError
 from app.agent.controller import AgentController
 from app.agent.schemas import TradeProposal
 from app.config import Settings, get_settings
+from app.execution.alpaca_paper import AlpacaOrderOutcomeUnknown
 from app.execution.paper_broker import PaperBroker
 from app.inference.gate import InferenceGateBusy
 from app.market_data.freshness import ensure_fresh_bars
@@ -62,6 +63,11 @@ class QueueWorker:
     async def _process(self, task: str, payload: dict[str, Any]) -> dict[str, Any]:
         if task == "analyze_proposal":
             timeframe = str(payload.get("timeframe", "intraday"))
+            if timeframe != "intraday":
+                raise ValueError(
+                    "This build accepts intraday proposal jobs only; discard this old queued job "
+                    "and submit a new five-minute analysis."
+                )
             bars = payload.get("bars", [])
             ensure_fresh_bars(bars, timeframe, self.max_stale_data_seconds)
             result = await self.agent.run(task, payload)
@@ -226,9 +232,27 @@ class QueueWorker:
                     "side": proposal.side,
                     "quantity": execution["quantity"],
                     "simulated_price": execution["simulated_price"],
+                    "execution_mode": execution.get("execution_mode", "local_simulation"),
+                    "broker_order_id": execution.get("broker_order_id"),
                     "reason": str(proposal.thesis)[:240],
                 })
                 opened += 1
+            except AlpacaOrderOutcomeUnknown as exc:
+                # A broker write may have succeeded even though its response was lost.
+                # Keep the proposal and durable intent pending so the next broker sync can
+                # recover the confirmed fill or block additional entries for reconciliation.
+                reason = str(exc).replace("\\n", " ")[:300]
+                self.db.add_audit("autonomous_trade.broker_outcome_unknown", {
+                    "symbol": symbol,
+                    "proposal_id": saved_proposal.get("id") if saved_proposal else None,
+                    "error_type": type(exc).__name__,
+                    "reason": reason,
+                })
+                decision_outcomes.append({
+                    "symbol": symbol, "decision": "trade",
+                    "status": "broker_pending", "reason": reason,
+                })
+                skipped += 1
             except (ValidationError, ValueError, TypeError, KeyError, RuntimeError) as exc:
                 if saved_proposal is not None:
                     try:
