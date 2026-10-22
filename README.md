@@ -84,4 +84,4 @@ npm run build
 
 ## Important limitations
 
-Paper results do not establish profitability. Alpaca Paper simulates fills; this application does not guarantee the same fills, account state or market outcomes as live trading. The session checker still needs an authoritative holiday/early-close calendar, and broker disconnect/restart/reconciliation paths should be tested before relying on it unattended. Live trading is intentionally unsupported.
+Paper results do not establish profitability. Alpaca Paper simulates fills; this application does not guarantee the same fills, account state or market outcomes as live trading. The session checker now uses the installed NYSE calendar package for holidays and early closes. Its schedule is shipped with the package rather than fetched live, so update the dependency regularly. Broker disconnect/restart/reconciliation paths should be tested before relying on it unattended. Live trading is intentionally unsupported.
