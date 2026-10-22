@@ -140,7 +140,7 @@ def test_ambiguous_or_unapproved_symbol_fails_closed(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_intraday_positions_close_after_us_session_end(tmp_path):
+async def test_intraday_position_is_not_closed_on_a_stale_mark_when_final_candle_is_missing(tmp_path):
     ny = ZoneInfo("America/New_York")
     settings = _settings(tmp_path)
     db = Database(settings.database_path)
@@ -160,13 +160,67 @@ async def test_intraday_positions_close_after_us_session_end(tmp_path):
 
     with db.connect() as conn:
         row = conn.execute(
-            "SELECT status, realized_pnl FROM positions WHERE id='pos-eod'"
+            "SELECT status, current_price, realized_pnl FROM positions WHERE id='pos-eod'"
         ).fetchone()
         audit_row = conn.execute(
-            "SELECT details_json FROM audit WHERE event='paper_position.session_close'"
+            "SELECT details_json FROM audit WHERE event='paper_position.session_close_skipped' "
+            "ORDER BY created_at DESC LIMIT 1"
+        ).fetchone()
+    assert row["status"] == "open"
+    assert row["current_price"] == pytest.approx(101)
+    assert row["realized_pnl"] == pytest.approx(0)
+    assert events == []
+    assert audit_row is not None
+    assert json.loads(audit_row["details_json"])["reason"] == (
+        "verified_final_regular_session_candle_unavailable"
+    )
+
+
+@pytest.mark.asyncio
+async def test_intraday_position_closes_at_verified_final_regular_session_candle(tmp_path):
+    ny = ZoneInfo("America/New_York")
+    settings = _settings(tmp_path)
+    db = Database(settings.database_path)
+    db.initialize(["AAPL"])
+    opened = datetime(2026, 10, 22, 15, 30, tzinfo=ny).isoformat()
+    with db.connect() as conn:
+        conn.execute(
+            "INSERT INTO positions(id,proposal_id,symbol,side,quantity,entry_price,current_price,"
+            "stop_loss,take_profit,status,opened_at,timeframe) "
+            "VALUES (?,?,?,?,?,?,?,?,?,'open',?,?)",
+            ("pos-eod-final", "proposal-eod-final", "AAPL", "long", 10, 100, 101, 95, 110,
+             opened, "intraday"),
+        )
+
+    class FinalBarProvider:
+        configured = True
+
+        async def fetch_bars(self, symbols, timeframe="5Min", limit=50, start_time=None):
+            return [{
+                "symbol": "AAPL", "timestamp": "2026-10-22T19:55:00+00:00",
+                "open": 101.0, "high": 102.0, "low": 100.5,
+                "close": 101.5, "volume": 10000,
+            }]
+
+    monitor = MarketMonitor(settings, db, FinalBarProvider(), EmptyFeeds())
+    after_close = datetime(2026, 10, 22, 16, 5, tzinfo=ny)
+
+    events = await monitor.close_intraday_positions_after_session(after_close)
+
+    with db.connect() as conn:
+        row = conn.execute(
+            "SELECT status, current_price, realized_pnl FROM positions WHERE id='pos-eod-final'"
+        ).fetchone()
+        audit_row = conn.execute(
+            "SELECT details_json FROM audit WHERE event='paper_position.session_close' "
+            "ORDER BY created_at DESC LIMIT 1"
         ).fetchone()
     assert row["status"] == "closed"
-    assert row["realized_pnl"] == pytest.approx(10.0)
+    assert row["current_price"] == pytest.approx(101.5)
+    assert row["realized_pnl"] == pytest.approx(15.0)
     assert audit_row is not None
-    assert json.loads(audit_row["details_json"])["reason"] == "us_regular_session_close"
+    details = json.loads(audit_row["details_json"])
+    assert details["reason"] == "us_regular_session_close"
+    assert details["mark_source"] == "alpaca_completed_final_five_minute_candle"
+    assert details["final_bar_timestamp"] == "2026-10-22T19:55:00+00:00"
     assert events[0]["mode"] == "paper"
