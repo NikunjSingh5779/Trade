@@ -48,6 +48,7 @@ export default function AgentDashboard() {
   const [busy, setBusy] = useState("");
   const [notice, setNotice] = useState("");
   const [error, setError] = useState("");
+  const [resolveConfirmations, setResolveConfirmations] = useState<Record<string, boolean>>({});
 
   const refresh = useCallback(async () => {
     try {
@@ -131,6 +132,28 @@ export default function AgentDashboard() {
     finally { setBusy(""); }
   }
 
+  async function resolveNoOrder(proposalId: string, symbolName: string) {
+    if (!resolveConfirmations[proposalId]) {
+      setError("Confirm that you checked both Alpaca Paper Orders and Positions first.");
+      return;
+    }
+    setBusy(`resolve:${proposalId}`); setNotice(""); setError("");
+    try {
+      const result = await api<{ status: string; symbol: string; note: string }>(
+        `/api/execution/intents/${proposalId}/resolve-no-order`,
+        {
+          method: "POST",
+          body: JSON.stringify({ confirm_no_order_and_no_position: true })
+        }
+      );
+      setNotice(`${result.symbol || symbolName}: ${result.note}`);
+      setResolveConfirmations(previous => ({ ...previous, [proposalId]: false }));
+      await refresh();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Could not resolve the unknown broker order.");
+    } finally { setBusy(""); }
+  }
+
   const pending = proposals.filter(p => p.status === "pending");
   const latestResponse = jobs.find(
     j => j.status === "succeeded" && j.result?.text && j.task !== "market_scan"
@@ -189,6 +212,31 @@ export default function AgentDashboard() {
           <p className="mt-1 leading-5">{execution.error ?? execution.note ?? "Execution status is not available."}</p>
           {!!execution.issues?.length && <div className="mt-2 space-y-1">{execution.issues.map((issue, i) => <p key={`${issue}-${i}`}>• {issue}</p>)}</div>}
           {execution.connected && execution.account?.equity && <p className="mt-2">Alpaca account equity: <strong>{money(Number(execution.account.equity))}</strong> · buying power: {money(Number(execution.account.buying_power ?? 0))}</p>}
+          {execution.mode === "alpaca_paper" && !!execution.unresolved_intents?.length && <div className="mt-4 space-y-3 border-t border-[#34445a] pt-3">
+            <div className="font-semibold text-amber-100">Unresolved Alpaca Paper submissions</div>
+            <p className="leading-5 text-amber-100/90">New broker entries stay blocked while any order result is ambiguous. Only resolve one after waiting at least 120 seconds and manually checking both the Alpaca Paper Orders page and Positions page for that symbol. If an order or position exists, do not release it.</p>
+            {execution.unresolved_intents.map(intent => <div key={intent.proposal_id} className="rounded-lg border border-amber-800/70 bg-[#111827] p-3">
+              <div className="flex flex-wrap items-center justify-between gap-2"><strong>{intent.symbol}</strong><span className="text-[10px] uppercase tracking-wide">{intent.status.replaceAll("_", " ")} · proposal {intent.proposal_status}</span></div>
+              <p className="mt-1 text-[10px] text-[#9eacc0]">Intent created: {new Date(intent.created_at).toLocaleString()}</p>
+              <label className="mt-3 flex cursor-pointer items-start gap-2 leading-5">
+                <input
+                  type="checkbox"
+                  className="mt-1"
+                  checked={Boolean(resolveConfirmations[intent.proposal_id])}
+                  onChange={event => setResolveConfirmations(previous => ({
+                    ...previous, [intent.proposal_id]: event.target.checked
+                  }))}
+                />
+                <span>I checked Alpaca Paper Orders and Positions. Neither shows this order or a position for {intent.symbol}.</span>
+              </label>
+              <button
+                type="button"
+                disabled={!resolveConfirmations[intent.proposal_id] || Boolean(busy)}
+                onClick={() => void resolveNoOrder(intent.proposal_id, intent.symbol)}
+                className="mt-3 rounded-lg border border-amber-700 px-3 py-2 text-xs font-semibold text-amber-100 disabled:cursor-not-allowed disabled:opacity-40"
+              >{busy === `resolve:${intent.proposal_id}` ? "Checking…" : "Release after verification"}</button>
+            </div>)}
+          </div>}
         </div>}
       </Panel>
 
