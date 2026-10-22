@@ -589,3 +589,73 @@ def test_close_intent_resolution_requires_wait_period(tmp_path, monkeypatch):
         broker.resolve_unknown_close_intent(
             position["id"], confirmed_no_close_order_and_position_open=True
         )
+
+
+
+def test_duplicate_unresolved_broker_intent_cannot_be_registered_twice(tmp_path):
+    settings, db, proposal, client_order_id = _prepare_unknown_intent(tmp_path)
+
+    with pytest.raises(ValueError, match="submission for this proposal is unresolved"):
+        db.register_broker_order_intent(
+            proposal["id"], proposal["version"], client_order_id, "AAPL"
+        )
+
+    with db.connect() as conn:
+        intents = conn.execute(
+            "SELECT COUNT(*) FROM broker_order_intents WHERE proposal_id=?",
+            (proposal["id"],),
+        ).fetchone()[0]
+    assert intents == 1
+
+
+def test_autonomous_worker_does_not_reject_proposal_after_local_broker_fill_bookkeeping_error(
+    tmp_path, monkeypatch
+):
+    settings = _settings(
+        tmp_path, autonomous_paper_trading_enabled=True,
+        autonomous_trading_symbols="AAPL", watchlist_symbols="AAPL",
+    )
+    db = Database(settings.database_path)
+    db.initialize(["AAPL"])
+    now = datetime.now(UTC)
+    bars = [{
+        "symbol": "AAPL",
+        "timestamp": (now - timedelta(minutes=6 + 5 * (11 - i))).isoformat(),
+        "open": 100.0, "high": 100.5, "low": 99.5, "close": 100.0, "volume": 1000,
+    } for i in range(12)]
+    db.save_bars(bars, source="test", timeframe="5Min")
+    broker = PaperBroker(settings, db)
+
+    def fail_after_intent(proposal_id, version, **kwargs):
+        db.register_broker_order_intent(
+            proposal_id, version, PaperBroker._client_order_id(proposal_id), "AAPL"
+        )
+        raise ValueError("simulated local position insert failed after broker submission")
+
+    monkeypatch.setattr(broker, "approve", fail_after_intent)
+
+    class StubAgent:
+        async def run(self, task, payload):
+            return {"task": task, "text": "", "provider": {}}
+
+    worker = QueueWorker(db, StubAgent(), settings=settings, paper_broker=broker)
+    decision = {
+        "symbol": "AAPL", "decision": "trade", "side": "long",
+        "entry_price": 100.0, "stop_loss": 98.0, "take_profit": 104.0,
+        "thesis": "Completed five-minute candles support this intraday test setup.",
+        "evidence": ["latest close 100"], "strategy_id": "test",
+    }
+    result = {"structured": {"decisions": [decision]}}
+    worker._execute_autonomous_scan(result, {
+        "symbols": ["AAPL"], "bars_by_symbol": {"AAPL": bars},
+    })
+
+    saved = db.list_proposals()
+    assert len(saved) == 1
+    assert saved[0]["status"] == "pending"
+    assert result["autonomous_trading"]["decision_outcomes"][0]["status"] == "broker_pending"
+    with db.connect() as conn:
+        intent = conn.execute(
+            "SELECT status FROM broker_order_intents WHERE proposal_id=?", (saved[0]["id"],)
+        ).fetchone()
+    assert intent["status"] == "unknown"
