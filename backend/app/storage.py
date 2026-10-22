@@ -70,6 +70,14 @@ class Database:
                     execution_mode TEXT NOT NULL DEFAULT 'local_simulation'
                 );
                 CREATE INDEX IF NOT EXISTS ix_positions_status ON positions(status);
+                CREATE TABLE IF NOT EXISTS broker_order_intents (
+                    proposal_id TEXT PRIMARY KEY, proposal_version INTEGER NOT NULL,
+                    client_order_id TEXT NOT NULL UNIQUE, symbol TEXT NOT NULL,
+                    status TEXT NOT NULL, broker_order_id TEXT, last_error TEXT,
+                    created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS ix_broker_order_intents_status
+                    ON broker_order_intents(status, updated_at);
                 CREATE TABLE IF NOT EXISTS watchlist (
                     symbol TEXT PRIMARY KEY, enabled INTEGER NOT NULL DEFAULT 1,
                     created_at TEXT NOT NULL
@@ -461,6 +469,60 @@ class Database:
                     "requested_entry_price": float(body["entry_price"]),
                     "slippage_bps": float(slippage_bps)}
 
+    def register_broker_order_intent(
+        self, proposal_id: str, version: int, client_order_id: str, symbol: str
+    ) -> dict[str, Any]:
+        """Durably record submission intent before contacting Alpaca."""
+        if not client_order_id.strip() or not symbol.strip():
+            raise ValueError("Broker submission requires a client order ID and symbol.")
+        now = utc_now()
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            proposal = conn.execute(
+                "SELECT version,status FROM proposals WHERE id=?", (proposal_id,)
+            ).fetchone()
+            if proposal is None:
+                conn.rollback()
+                raise KeyError("Proposal not found.")
+            if proposal["version"] != version or proposal["status"] != "pending":
+                conn.rollback()
+                raise ValueError("Proposal is stale, already reviewed, or not pending.")
+            existing = conn.execute(
+                "SELECT * FROM broker_order_intents WHERE proposal_id=?", (proposal_id,)
+            ).fetchone()
+            if existing is not None:
+                if existing["client_order_id"] != client_order_id:
+                    conn.rollback()
+                    raise ValueError("Proposal already has a different broker order intent.")
+                conn.commit()
+                return dict(existing)
+            conn.execute(
+                "INSERT INTO broker_order_intents(proposal_id,proposal_version,client_order_id,"
+                "symbol,status,created_at,updated_at) VALUES (?,?,?,?, 'submitting',?,?)",
+                (proposal_id, version, client_order_id, symbol.upper(), now, now),
+            )
+            conn.commit()
+            row = conn.execute(
+                "SELECT * FROM broker_order_intents WHERE proposal_id=?", (proposal_id,)
+            ).fetchone()
+            return dict(row)
+
+    def update_broker_order_intent(
+        self, proposal_id: str, status: str, *,
+        broker_order_id: str | None = None, last_error: str | None = None,
+    ) -> None:
+        allowed = {"submitting", "unknown", "recorded", "recovered", "rejected", "failed"}
+        if status not in allowed:
+            raise ValueError("Unsupported broker order intent status.")
+        with self.connect() as conn:
+            conn.execute(
+                "UPDATE broker_order_intents SET status=?, "
+                "broker_order_id=COALESCE(?,broker_order_id), last_error=?, updated_at=? "
+                "WHERE proposal_id=?",
+                (status, broker_order_id, last_error[:500] if last_error else None,
+                 utc_now(), proposal_id),
+            )
+
     def record_recovered_alpaca_paper_trade(
         self, proposal_id: str, version: int, quantity: int, fill_price: float,
         broker_order_id: str,
@@ -538,6 +600,11 @@ class Database:
             conn.execute(
                 "UPDATE proposals SET status='approved',updated_at=? WHERE id=?",
                 (now, proposal_id),
+            )
+            conn.execute(
+                "UPDATE broker_order_intents SET status='recovered',broker_order_id=?,"
+                "last_error=NULL,updated_at=? WHERE proposal_id=?",
+                (broker_order_id, now, proposal_id),
             )
             conn.commit()
             return {
