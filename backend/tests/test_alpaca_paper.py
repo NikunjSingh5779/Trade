@@ -1,3 +1,5 @@
+from datetime import UTC, datetime, timedelta
+
 import httpx
 import pytest
 import respx
@@ -5,7 +7,9 @@ from pydantic import ValidationError
 
 from app.config import Settings
 from app.execution.alpaca_paper import AlpacaPaperError, AlpacaPaperTrading, PAPER_BASE_URL
+import app.execution.paper_broker as paper_broker_module
 from app.execution.paper_broker import PaperBroker
+from app.storage import Database
 from app.storage import Database
 
 
@@ -124,3 +128,71 @@ def test_api_error_contains_request_id_but_not_credentials(tmp_path):
 
     assert route.called
     assert "paper-secret-test" not in str(exc.value)
+
+
+
+def test_broker_approval_records_confirmed_fill_and_close_uses_broker_fill(tmp_path, monkeypatch):
+    settings = _settings(tmp_path)
+    db = Database(settings.database_path)
+    db.initialize(["AAPL"])
+    now = datetime.now(UTC).isoformat()
+    db.save_bars([{
+        "symbol": "AAPL", "timestamp": now, "open": 100.0,
+        "high": 100.5, "low": 99.5, "close": 100.0, "volume": 10000,
+    }], source="test", timeframe="5Min")
+    proposal = db.add_proposal({
+        "symbol": "AAPL", "side": "long", "entry_price": 100.0, "stop_loss": 98.0,
+        "take_profit": 104.0, "thesis": "Intraday trend setup from the latest five-minute bars.",
+        "evidence": ["latest close: 100"], "strategy_id": "test", "timeframe": "intraday",
+        "data_asof": now, "data_timeframe": "intraday", "data_source": "test",
+    })
+    broker = PaperBroker(settings, db)
+    monkeypatch.setattr(paper_broker_module, "is_regular_us_session", lambda now=None: True)
+    monkeypatch.setattr(
+        paper_broker_module, "us_session_bounds",
+        lambda session_day: (datetime.now(UTC) - timedelta(hours=1),
+                              datetime.now(UTC) + timedelta(hours=1)),
+    )
+    monkeypatch.setattr(
+        broker, "_require_reconciled_broker",
+        lambda: ({"status": "ACTIVE", "equity": "100000"}, []),
+    )
+    submitted = {}
+    monkeypatch.setattr(
+        broker.alpaca, "submit_bracket",
+        lambda **kwargs: (
+            submitted.update(kwargs)
+            or {"id": "entry-order-1", "status": "filled", "filled_avg_price": "100.08"}
+        ),
+    )
+
+    result = broker.approve(proposal["id"], 1)
+
+    assert result["mode"] == "alpaca_paper"
+    assert result["execution_mode"] == "alpaca_paper"
+    assert result["broker_order_id"] == "entry-order-1"
+    assert result["fill_price"] == pytest.approx(100.08)
+    assert submitted["symbol"] == "AAPL"
+    assert submitted["client_order_id"].startswith("trade-")
+    with db.connect() as conn:
+        position = dict(conn.execute("SELECT * FROM positions WHERE status='open'").fetchone())
+    assert position["execution_mode"] == "alpaca_paper"
+    assert position["entry_price"] == pytest.approx(100.08)
+
+    monkeypatch.setattr(broker.alpaca, "positions", lambda: [{
+        "symbol": "AAPL", "qty": str(position["quantity"]), "side": "long",
+    }])
+    monkeypatch.setattr(
+        broker.alpaca, "close_position",
+        lambda symbol: {"id": "exit-order-1", "status": "filled", "filled_avg_price": "100.40"},
+    )
+
+    closed = broker.close_position(position["id"], reason="test_close")
+
+    assert closed["mode"] == "alpaca_paper"
+    assert closed["broker_order_id"] == "exit-order-1"
+    with db.connect() as conn:
+        row = conn.execute("SELECT status, current_price FROM positions WHERE id=?",
+                           (position["id"],)).fetchone()
+    assert row["status"] == "closed"
+    assert row["current_price"] == pytest.approx(100.40)
