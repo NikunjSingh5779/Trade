@@ -27,6 +27,11 @@ def _utc_now(value: datetime | None) -> datetime:
     return current.astimezone(UTC)
 
 
+def us_session_bounds(session_day: date | None = None) -> tuple[datetime, datetime] | None:
+    """Return the day's scheduled NYSE open/close in UTC; no bounds means market closed."""
+    return _session_bounds(session_day or datetime.now(NEW_YORK).date())
+
+
 def is_regular_us_session(now: datetime | None = None) -> bool:
     """True only within the NYSE regular session, including holidays and early closes."""
     current = _utc_now(now)
