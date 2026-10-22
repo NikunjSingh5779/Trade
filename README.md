@@ -8,7 +8,7 @@ The default mode is **local simulation**. It writes simulated fills to the app's
 
 Optional **Alpaca Paper mode** sends orders to the hard-coded https://paper-api.alpaca.markets endpoint. It records confirmed Alpaca Paper fills in SQLite, requests bracket orders with a stop and target, and displays the Alpaca account's equity/cash instead of presenting local simulation figures as broker figures. Live order endpoints are not implemented or configurable.
 
-Existing local-simulation positions cannot be transferred to Alpaca. Review them, then close only the positions you intend to remove from the local ledger before enabling Alpaca Paper order routing. The app flags local/broker discrepancies and blocks new Alpaca entries until reconciliation succeeds.
+Existing local-simulation positions cannot be transferred to Alpaca. Review them, then close only the positions you intend to remove from the local ledger before enabling Alpaca Paper order routing. The app flags local/broker discrepancies and blocks new Alpaca entries until reconciliation succeeds. Entry and close intents are persisted before broker writes; ambiguous outcomes are never blindly retried. A dashboard recovery control requires a 120-second wait, explicit operator confirmation and fresh checks against Alpaca Paper orders/positions.
 
 ## Safety settings
 
