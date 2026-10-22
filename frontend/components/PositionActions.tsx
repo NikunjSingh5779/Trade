@@ -6,7 +6,7 @@ import { api } from "@/lib/api";
 
 type Position = {
   id: string; symbol: string; current_price: number;
-  stop_loss: number; take_profit: number;
+  stop_loss: number; take_profit: number; execution_mode?: string;
 };
 
 export default function PositionActions({
@@ -46,17 +46,21 @@ export default function PositionActions({
 
   return (
     <div className="min-w-[210px] space-y-2">
-      <form onSubmit={updateStops} className="grid grid-cols-[1fr_1fr_auto] gap-1">
-        <label className="sr-only" htmlFor={`stop-${position.id}`}>Stop loss</label>
-        <input id={`stop-${position.id}`} type="number" step="0.01" min="0" value={stop}
-          onChange={e => setStop(e.target.value)} aria-label="Stop loss"
-          className="w-full rounded border border-[#31435a] bg-[#09111e] px-2 py-1.5 text-xs"/>
-        <label className="sr-only" htmlFor={`target-${position.id}`}>Take profit</label>
-        <input id={`target-${position.id}`} type="number" step="0.01" min="0" value={target}
-          onChange={e => setTarget(e.target.value)} aria-label="Take profit"
-          className="w-full rounded border border-[#31435a] bg-[#09111e] px-2 py-1.5 text-xs"/>
-        <button title="Save simulated stop and target" disabled={busy} className="rounded border border-[#39516d] px-2 text-[#a6f0ce] disabled:opacity-50"><SlidersHorizontal size={14}/></button>
-      </form>
+      {position.execution_mode === "alpaca_paper" ? (
+        <p className="text-[10px] leading-4 text-[#8e9cb2]">Stop/target are broker-managed bracket orders. Edit them in Alpaca Paper.</p>
+      ) : (
+        <form onSubmit={updateStops} className="grid grid-cols-[1fr_1fr_auto] gap-1">
+          <label className="sr-only" htmlFor={`stop-${position.id}`}>Stop loss</label>
+          <input id={`stop-${position.id}`} type="number" step="0.01" min="0" value={stop}
+            onChange={e => setStop(e.target.value)} aria-label="Stop loss"
+            className="w-full rounded border border-[#31435a] bg-[#09111e] px-2 py-1.5 text-xs"/>
+          <label className="sr-only" htmlFor={`target-${position.id}`}>Take profit</label>
+          <input id={`target-${position.id}`} type="number" step="0.01" min="0" value={target}
+            onChange={e => setTarget(e.target.value)} aria-label="Take profit"
+            className="w-full rounded border border-[#31435a] bg-[#09111e] px-2 py-1.5 text-xs"/>
+          <button title="Save simulated stop and target" disabled={busy} className="rounded border border-[#39516d] px-2 text-[#a6f0ce] disabled:opacity-50"><SlidersHorizontal size={14}/></button>
+        </form>
+      )}
       <button onClick={() => void closeAtMark()} disabled={busy}
         className="flex w-full items-center justify-center gap-1.5 rounded border border-[#4a3c47] px-2 py-1.5 text-xs text-[#ffbdc6] hover:bg-[#2b1923] disabled:opacity-50">
         <LogOut size={13}/> Close at mark
