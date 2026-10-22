@@ -3,6 +3,7 @@ from datetime import UTC, datetime, timedelta
 import pytest
 
 from app.config import Settings
+import app.execution.paper_broker as paper_broker_module
 from app.execution.paper_broker import PaperBroker
 from app.risk.validator import RiskRejected
 from app.storage import Database
@@ -47,7 +48,13 @@ def _body(**overrides):
     return body
 
 
-def test_approval_creates_simulated_order_and_position(tmp_path):
+def test_approval_creates_simulated_order_and_position(tmp_path, monkeypatch):
+    monkeypatch.setattr(paper_broker_module, "is_regular_us_session", lambda now=None: True)
+    monkeypatch.setattr(
+        paper_broker_module, "us_session_bounds",
+        lambda session_day: (datetime.now(UTC) - timedelta(hours=1),
+                             datetime.now(UTC) + timedelta(hours=1)),
+    )
     settings, db = _setup(tmp_path)
     proposal = db.add_proposal(_body())
     result = PaperBroker(settings, db).approve(proposal["id"], 1)
