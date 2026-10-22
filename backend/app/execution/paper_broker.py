@@ -4,7 +4,9 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from app.config import Settings
-from app.execution.alpaca_paper import AlpacaPaperError, AlpacaPaperTrading
+from app.execution.alpaca_paper import (
+    AlpacaOrderOutcomeUnknown, AlpacaOrderRejected, AlpacaPaperError, AlpacaPaperTrading,
+)
 from app.market_data.freshness import (
     MarketDataFreshnessError, ensure_fresh_bars, max_age_seconds,
   )
@@ -562,17 +564,54 @@ class PaperBroker:
         broker_order: dict[str, Any] | None = None
         broker_order_id: str | None = None
         if alpaca_mode:
-            # The stable client ID prevents duplicate brokerage orders after a timeout/restart.
-            broker_order = self.alpaca.submit_bracket(
-                symbol=validated.symbol, side=validated.side, quantity=quantity,
-                stop_loss=validated.stop_loss, take_profit=validated.take_profit,
-                client_order_id=self._client_order_id(proposal_id),
+            # Persist the intent before contacting Alpaca. If the HTTP response is lost,
+            # a later sync can look up the same client ID rather than creating a duplicate.
+            client_order_id = self._client_order_id(proposal_id)
+            self.db.register_broker_order_intent(
+                proposal_id, version, client_order_id, validated.symbol
             )
+            try:
+                broker_order = self.alpaca.submit_bracket(
+                    symbol=validated.symbol, side=validated.side, quantity=quantity,
+                    stop_loss=validated.stop_loss, take_profit=validated.take_profit,
+                    client_order_id=client_order_id,
+                )
+            except AlpacaOrderOutcomeUnknown as exc:
+                self.db.update_broker_order_intent(
+                    proposal_id, "unknown", last_error=str(exc)
+                )
+                self.db.add_audit("alpaca_paper.entry_outcome_unknown", {
+                    "proposal_id": proposal_id, "symbol": validated.symbol,
+                    "client_order_id": client_order_id, "error": str(exc)[:400],
+                })
+                raise
+            except AlpacaOrderRejected as exc:
+                self.db.update_broker_order_intent(
+                    proposal_id, "rejected", last_error=str(exc)
+                )
+                try:
+                    self.db.reject_proposal(proposal_id, version)
+                except (KeyError, ValueError):
+                    pass
+                raise
+            except AlpacaPaperError as exc:
+                # Authentication/data errors before a confirmed write can be retried after
+                # correcting credentials; no local position is recorded.
+                self.db.update_broker_order_intent(
+                    proposal_id, "failed", last_error=str(exc)
+                )
+                raise
             broker_order_id = str(broker_order["id"])
             fill_price = float(broker_order["filled_avg_price"])
             estimated_risk = quantity * abs(fill_price - float(validated.stop_loss))
             if fill_price <= 0:
-                raise AlpacaPaperError("Alpaca Paper reported a non-positive entry fill price.")
+                self.db.update_broker_order_intent(
+                    proposal_id, "unknown", broker_order_id=broker_order_id,
+                    last_error="Alpaca returned a non-positive fill price.",
+                )
+                raise AlpacaOrderOutcomeUnknown(
+                    "Alpaca Paper reported a non-positive fill price; broker intent is retained for reconciliation."
+                )
 
         result = self.db.approve_paper_trade(
             proposal_id, version, quantity, self.settings.max_open_positions,
@@ -582,6 +621,10 @@ class PaperBroker:
             execution_mode=execution_mode,
             broker_order_id=broker_order_id,
         )
+        if alpaca_mode:
+            self.db.update_broker_order_intent(
+                proposal_id, "recorded", broker_order_id=broker_order_id
+            )
         self.db.add_audit("paper_trade.approved", {
             "proposal_id": proposal_id, "version": version, "symbol": validated.symbol,
             "quantity": quantity, "estimated_risk": estimated_risk, "order_id": result["order_id"],
