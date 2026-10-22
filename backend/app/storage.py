@@ -494,7 +494,7 @@ class Database:
                 if existing["client_order_id"] != client_order_id:
                     conn.rollback()
                     raise ValueError("Proposal already has a different broker order intent.")
-                if existing["status"] == "failed":
+                if existing["status"] in {"failed", "resolved_no_order"}:
                     conn.execute(
                         "UPDATE broker_order_intents SET status='submitting',last_error=NULL,updated_at=? "
                         "WHERE proposal_id=?",
@@ -520,7 +520,7 @@ class Database:
         self, proposal_id: str, status: str, *,
         broker_order_id: str | None = None, last_error: str | None = None,
     ) -> None:
-        allowed = {"submitting", "unknown", "recorded", "recovered", "rejected", "failed"}
+        allowed = {"submitting", "unknown", "recorded", "recovered", "rejected", "failed", "resolved_no_order"}
         if status not in allowed:
             raise ValueError("Unsupported broker order intent status.")
         with self.connect() as conn:
