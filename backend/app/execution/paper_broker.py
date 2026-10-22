@@ -466,6 +466,124 @@ class PaperBroker:
         positions = self.alpaca.positions()
         return account, positions
 
+    @staticmethod
+    def _matching_market_close_order(
+        orders: list[dict[str, Any]], position: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        expected_side = "sell" if str(position.get("side", "")).lower() == "long" else "buy"
+        expected_qty = abs(float(position.get("quantity", 0)))
+        matching: list[dict[str, Any]] = []
+        for order in orders:
+            try:
+                side = str(order.get("side", "")).lower()
+                order_type = str(order.get("type", "")).lower()
+                order_qty = abs(float(order.get("qty") or 0))
+            except (TypeError, ValueError):
+                continue
+            # DELETE /positions creates a market order to flatten the open position.
+            # Ignore bracket stop/limit legs and the older parent entry order.
+            if (
+                side == expected_side and order_type == "market"
+                and expected_qty > 0 and abs(order_qty - expected_qty) <= 1e-6
+            ):
+                matching.append(order)
+        if not matching:
+            return None
+        matching.sort(key=lambda item: str(
+            item.get("submitted_at") or item.get("created_at") or item.get("updated_at") or ""
+        ))
+        return matching[-1]
+
+    def resolve_unknown_close_intent(
+        self, position_id: str, *, confirmed_no_close_order_and_position_open: bool
+    ) -> dict[str, Any]:
+        """Release a stale close intent only after explicit confirmation and broker API checks."""
+        if not self.settings.alpaca_paper_trading_enabled or not self.alpaca.configured:
+            raise RiskRejected("Enable and connect Alpaca Paper before resolving a close intent.")
+        if confirmed_no_close_order_and_position_open is not True:
+            raise RiskRejected(
+                "Explicit confirmation that no close order exists and the position remains open is required."
+            )
+        with self.db.connect() as conn:
+            row = conn.execute(
+                "SELECT ci.*, p.status AS position_status, p.side, p.quantity, "
+                "p.execution_mode, p.current_price FROM broker_close_intents ci "
+                "JOIN positions p ON p.id=ci.position_id WHERE ci.position_id=?",
+                (position_id,),
+            ).fetchone()
+        if row is None:
+            raise KeyError("No broker close intent exists for this position.")
+        intent = dict(row)
+        if intent["status"] not in {"submitting", "unknown"}:
+            raise ValueError(
+                f"Close intent status is {intent['status']!r}; only submitting/unknown intents can be resolved."
+            )
+        if intent["position_status"] != "open" or intent["execution_mode"] != "alpaca_paper":
+            raise RiskRejected("The local broker-backed position is not open; refresh reconciliation first.")
+        try:
+            created_at = datetime.fromisoformat(
+                str(intent["created_at"]).replace("Z", "+00:00")
+            )
+            if created_at.tzinfo is None:
+                created_at = created_at.replace(tzinfo=UTC)
+        except (TypeError, ValueError) as exc:
+            raise RiskRejected("Broker close intent has an invalid timestamp; manual review is required.") from exc
+        age_seconds = (datetime.now(UTC) - created_at.astimezone(UTC)).total_seconds()
+        if age_seconds < 120:
+            raise RiskRejected(
+                "Wait at least 120 seconds after the ambiguous close before resolving it."
+            )
+
+        symbol = str(intent["symbol"]).upper()
+        orders = self.alpaca.list_orders(symbol=symbol, after=str(intent["created_at"]), limit=100)
+        matching_order = self._matching_market_close_order(orders, intent)
+        if matching_order is not None:
+            status = str(matching_order.get("status") or "unknown").lower()
+            filled_qty = abs(float(matching_order.get("filled_qty") or 0))
+            if status in {"canceled", "rejected", "expired"} and filled_qty <= 0:
+                self.db.update_broker_close_intent(
+                    position_id, "failed", broker_order_id=str(matching_order.get("id") or ""),
+                    last_error=f"Alpaca close order ended as {status} with no fill.",
+                )
+                raise RiskRejected(
+                    f"Alpaca shows a terminal close order ({status}) with no fill. You may retry close after refresh."
+                )
+            raise RiskRejected(
+                f"Alpaca shows a matching close order (status={status}); do not release or resubmit it."
+            )
+
+        remote_by_symbol = {
+            str(item.get("symbol", "")).upper(): item for item in self.alpaca.positions()
+        }
+        remote = remote_by_symbol.get(symbol)
+        if remote is None:
+            raise RiskRejected(
+                "Alpaca no longer reports this position. Refresh execution status so its confirmed exit can be reconciled."
+            )
+        try:
+            remote_qty = abs(float(remote.get("qty", 0)))
+            remote_side = str(remote.get("side", "")).lower()
+            local_qty = abs(float(intent["quantity"]))
+            local_side = str(intent["side"]).lower()
+        except (TypeError, ValueError) as exc:
+            raise RiskRejected("Alpaca/local position quantity is invalid; manual review is required.") from exc
+        if remote_side != local_side or abs(remote_qty - local_qty) > 1e-6:
+            raise RiskRejected("Alpaca/local position size or side differs; do not release the close intent.")
+
+        self.db.update_broker_close_intent(
+            position_id, "resolved_no_order",
+            last_error="Operator confirmed no close order and position remains open after API checks.",
+        )
+        self.db.add_audit("alpaca_paper.close_intent_resolved_no_order", {
+            "position_id": position_id, "symbol": symbol,
+            "operator_confirmed_no_close_order_and_position_open": True,
+            "age_seconds": int(age_seconds),
+        })
+        return {
+            "position_id": position_id, "symbol": symbol, "status": "resolved_no_order",
+            "note": "No matching close order was found and the broker position remains open. You may now retry Close.",
+        }
+
     def close_position(self, position_id: str, *, reason: str = "manual_close") -> dict[str, Any]:
         with self.db.connect() as conn:
             row = conn.execute("SELECT * FROM positions WHERE id=?", (position_id,)).fetchone()
