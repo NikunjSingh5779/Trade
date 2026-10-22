@@ -7,6 +7,7 @@ import { api } from "@/lib/api";
 type Position = {
   id: string; symbol: string; current_price: number;
   stop_loss: number; take_profit: number; execution_mode?: string;
+  close_intent_status?: string;
 };
 
 export default function PositionActions({
@@ -61,9 +62,10 @@ export default function PositionActions({
           <button title="Save simulated stop and target" disabled={busy} className="rounded border border-[#39516d] px-2 text-[#a6f0ce] disabled:opacity-50"><SlidersHorizontal size={14}/></button>
         </form>
       )}
-      <button onClick={() => void closeAtMark()} disabled={busy}
+      {position.close_intent_status && <p className="text-[10px] leading-4 text-amber-100">A previous close is unresolved. Use the broker-status recovery panel before retrying; do not submit another close yet.</p>}
+      <button onClick={() => void closeAtMark()} disabled={busy || Boolean(position.close_intent_status)}
         className="flex w-full items-center justify-center gap-1.5 rounded border border-[#4a3c47] px-2 py-1.5 text-xs text-[#ffbdc6] hover:bg-[#2b1923] disabled:opacity-50">
-        <LogOut size={13}/> {position.execution_mode === "alpaca_paper" ? "Close via Alpaca Paper" : "Close at local mark"}
+        <LogOut size={13}/> {position.close_intent_status ? "Close awaiting reconciliation" : position.execution_mode === "alpaca_paper" ? "Close via Alpaca Paper" : "Close at local mark"}
       </button>
       {error && <p className="max-w-[230px] whitespace-normal text-[11px] text-red-300">{error}</p>}
     </div>
