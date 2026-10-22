@@ -9,7 +9,7 @@ from app.market_data.alpaca import AlpacaMarketData
 from app.market_data.feeds import ConfiguredFeedService
 from app.market_data.freshness import MarketDataFreshnessError, ensure_fresh_bars
 from app.market_data.sessions import current_scan_window, is_regular_us_bar, is_regular_us_session, us_session_bounds
-from app.execution.paper_broker import AlpacaPaperError, PaperBroker
+from app.execution.paper_broker import PaperBroker
 from app.storage import Database
 
 
