@@ -74,3 +74,10 @@ class JobResponse(BaseModel):
     id: str
     task: str
     status: str
+
+
+
+class ResolveBrokerIntentRequest(BaseModel):
+    # This is deliberately explicit: recovery is allowed only after the operator
+    # has checked both the Alpaca Paper order list and its positions.
+    confirm_no_order_and_no_position: Literal[True]
