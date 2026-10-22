@@ -449,3 +449,143 @@ def test_unknown_order_intent_resolves_only_after_api_checks_and_confirmation(tm
         ).fetchone())
     assert retried["status"] == "submitting"
     assert retried["client_order_id"] == client_order_id
+
+
+
+def _open_alpaca_position(tmp_path):
+    settings = _settings(tmp_path)
+    db = Database(settings.database_path)
+    db.initialize(["AAPL"])
+    now = datetime.now(UTC)
+    proposal = db.add_proposal(_proposal_body(now.isoformat()))
+    created = db.approve_paper_trade(
+        proposal["id"], proposal["version"], 10, 5, 20000,
+        simulated_fill_price=100.0, execution_mode="alpaca_paper",
+        broker_order_id="entry-order-existing",
+    )
+    with db.connect() as conn:
+        position = dict(conn.execute(
+            "SELECT * FROM positions WHERE id=?", (created["position_id"],)
+        ).fetchone())
+    return settings, db, position
+
+
+def test_ambiguous_broker_close_is_durable_and_never_submitted_twice(tmp_path, monkeypatch):
+    settings, db, position = _open_alpaca_position(tmp_path)
+    broker = PaperBroker(settings, db)
+    monkeypatch.setattr(paper_broker_module, "is_regular_us_session", lambda now=None: True)
+    monkeypatch.setattr(broker.alpaca, "positions", lambda: [{
+        "symbol": "AAPL", "qty": "10", "side": "long",
+        "current_price": "100.20", "market_value": "1002",
+    }])
+    attempts = []
+
+    def timeout_close(symbol):
+        attempts.append(symbol)
+        raise AlpacaOrderOutcomeUnknown("connection timeout after close request")
+
+    monkeypatch.setattr(broker.alpaca, "close_position", timeout_close)
+    with pytest.raises(AlpacaOrderOutcomeUnknown):
+        broker.close_position(position["id"])
+
+    with db.connect() as conn:
+        intent = dict(conn.execute(
+            "SELECT * FROM broker_close_intents WHERE position_id=?", (position["id"],)
+        ).fetchone())
+    assert intent["status"] == "unknown"
+    assert intent["symbol"] == "AAPL"
+
+    with pytest.raises(ValueError, match="prior Alpaca Paper close has an unresolved result"):
+        broker.close_position(position["id"])
+    assert attempts == ["AAPL"]
+
+    with db.connect() as conn:
+        row = conn.execute(
+            "SELECT status FROM positions WHERE id=?", (position["id"],)
+        ).fetchone()
+    assert row["status"] == "open"
+
+
+def test_ambiguous_close_is_recovered_from_filled_market_order(tmp_path, monkeypatch):
+    settings, db, position = _open_alpaca_position(tmp_path)
+    broker = PaperBroker(settings, db)
+    old_time = (datetime.now(UTC) - timedelta(minutes=5)).isoformat()
+    db.register_broker_close_intent(position["id"], "AAPL")
+    db.update_broker_close_intent(position["id"], "unknown", last_error="response lost")
+    with db.connect() as conn:
+        conn.execute(
+            "UPDATE broker_close_intents SET created_at=?,updated_at=? WHERE position_id=?",
+            (old_time, old_time, position["id"]),
+        )
+
+    monkeypatch.setattr(broker.alpaca, "positions", lambda: [])
+    monkeypatch.setattr(broker.alpaca, "list_orders", lambda **kwargs: [{
+        "id": "close-order-confirmed", "symbol": "AAPL", "side": "sell",
+        "type": "market", "qty": "10", "filled_qty": "10",
+        "filled_avg_price": "101.25", "status": "filled",
+        "submitted_at": (datetime.now(UTC) - timedelta(minutes=4)).isoformat(),
+    }])
+
+    status = broker.sync_broker_positions()
+
+    assert status["reconciled"] is True
+    assert status["auto_closed"][0]["broker_order_id"] == "close-order-confirmed"
+    with db.connect() as conn:
+        row = conn.execute(
+            "SELECT status,current_price,realized_pnl FROM positions WHERE id=?",
+            (position["id"],),
+        ).fetchone()
+        intent = conn.execute(
+            "SELECT status,broker_order_id FROM broker_close_intents WHERE position_id=?",
+            (position["id"],),
+        ).fetchone()
+    assert row["status"] == "closed"
+    assert row["current_price"] == pytest.approx(101.25)
+    assert row["realized_pnl"] == pytest.approx(12.5)
+    assert intent["status"] == "recorded"
+    assert intent["broker_order_id"] == "close-order-confirmed"
+
+
+def test_close_intent_cannot_be_released_when_matching_order_exists(tmp_path, monkeypatch):
+    settings, db, position = _open_alpaca_position(tmp_path)
+    broker = PaperBroker(settings, db)
+    db.register_broker_close_intent(position["id"], "AAPL")
+    db.update_broker_close_intent(position["id"], "unknown", last_error="response lost")
+    old_time = (datetime.now(UTC) - timedelta(minutes=5)).isoformat()
+    with db.connect() as conn:
+        conn.execute(
+            "UPDATE broker_close_intents SET created_at=?,updated_at=? WHERE position_id=?",
+            (old_time, old_time, position["id"]),
+        )
+    monkeypatch.setattr(broker.alpaca, "list_orders", lambda **kwargs: [{
+        "id": "close-order-found", "symbol": "AAPL", "side": "sell",
+        "type": "market", "qty": "10", "filled_qty": "0", "status": "new",
+        "submitted_at": (datetime.now(UTC) - timedelta(minutes=4)).isoformat(),
+    }])
+
+    with pytest.raises(Exception, match="matching close order exists"):
+        broker.resolve_unknown_close_intent(
+            position["id"], confirmed_no_close_order_and_position_open=True
+        )
+
+    with db.connect() as conn:
+        intent = conn.execute(
+            "SELECT status FROM broker_close_intents WHERE position_id=?", (position["id"],)
+        ).fetchone()
+    assert intent["status"] == "unknown"
+
+
+def test_close_intent_resolution_requires_wait_period(tmp_path, monkeypatch):
+    settings, db, position = _open_alpaca_position(tmp_path)
+    broker = PaperBroker(settings, db)
+    db.register_broker_close_intent(position["id"], "AAPL")
+    db.update_broker_close_intent(position["id"], "unknown", last_error="response lost")
+    monkeypatch.setattr(broker.alpaca, "list_orders", lambda **kwargs: [])
+    monkeypatch.setattr(broker.alpaca, "positions", lambda: [{
+        "symbol": "AAPL", "qty": "10", "side": "long",
+    }])
+
+    with pytest.raises(Exception, match="at least 120 seconds"):
+        broker.resolve_unknown_close_intent(
+            position["id"], confirmed_no_close_order_and_position_open=True
+        )
