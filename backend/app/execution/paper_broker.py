@@ -9,7 +9,7 @@ from app.market_data.freshness import (
   )
 from app.risk.validator import RiskRejected, validate_and_size
 from app.storage import Database
-from app.market_data.sessions import is_regular_us_bar, is_regular_us_session
+from app.market_data.sessions import is_regular_us_bar, is_regular_us_session, us_session_bounds
 
 NEW_YORK = ZoneInfo("America/New_York")
 
@@ -199,6 +199,11 @@ class PaperBroker:
             return result
         if not self.settings.alpaca_paper_trading_enabled:
             raise RiskRejected("Alpaca Paper execution is disabled; broker-backed position was not closed.")
+        if not is_regular_us_session():
+            raise AlpacaPaperError(
+                "Alpaca Paper market closes are deferred until NYSE regular hours; "
+                "the position remains broker-protected and has not been locally closed."
+            )
         remote = {str(item.get("symbol", "")).upper(): item for item in self.alpaca.positions()}
         if str(position["symbol"]).upper() not in remote:
             self.sync_broker_positions()
@@ -228,10 +233,13 @@ class PaperBroker:
         if automated:
             if not self.settings.autonomous_paper_trading_enabled:
                 raise RuntimeError("Autonomous paper trading is disabled.")
-            if not is_regular_us_session():
-                raise RiskRejected("Automated entries are allowed only during regular US market hours.")
-        if self.settings.alpaca_paper_trading_enabled and not is_regular_us_session():
-            raise RiskRejected("Alpaca Paper entries are allowed only during regular US market hours.")
+        if automated or self.settings.alpaca_paper_trading_enabled:
+            now_for_session = datetime.now(UTC)
+            if not is_regular_us_session(now_for_session):
+                raise RiskRejected("Intraday entries are allowed only during regular US market hours.")
+            session = us_session_bounds(now_for_session.astimezone(NEW_YORK).date())
+            if session and now_for_session >= session[1] - timedelta(minutes=5):
+                raise RiskRejected("New intraday entries are blocked during the final five minutes of the US session.")
 
         proposal_record = self.db.get_proposal(proposal_id)
         if proposal_record is None:
