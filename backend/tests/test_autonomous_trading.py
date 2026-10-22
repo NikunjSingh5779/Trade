@@ -98,6 +98,8 @@ def test_autonomous_decision_opens_only_a_valid_paper_position(tmp_path, monkeyp
     assert portfolio["open_positions"][0]["timeframe"] == "intraday"
     assert db.list_orders()[0]["status"] == "filled"
     assert result["autonomous_trading"]["paper_trades_opened"] == 1
+    assert result["autonomous_trading"]["decision_outcomes"][0]["status"] == "opened"
+    assert result["autonomous_trading"]["decision_outcomes"][0]["simulated_price"] == pytest.approx(100.05)
     assert settings.live_trading_enabled is False
 
 
@@ -127,6 +129,10 @@ def test_ambiguous_or_unapproved_symbol_fails_closed(tmp_path, monkeypatch):
     )
     assert len(db.portfolio_snapshot(settings.paper_initial_equity)["open_positions"]) == 1
     assert result["autonomous_trading"]["paper_trades_opened"] == 1
+    outcomes = result["autonomous_trading"]["decision_outcomes"]
+    assert outcomes[0]["status"] == "opened"
+    assert outcomes[1]["symbol"] == "TSLA"
+    assert outcomes[1]["status"] == "skipped"
     events = []
     with db.connect() as conn:
         events = [row["event"] for row in conn.execute("SELECT event FROM audit").fetchall()]
