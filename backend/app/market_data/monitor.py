@@ -9,6 +9,7 @@ from app.market_data.alpaca import AlpacaMarketData
 from app.market_data.feeds import ConfiguredFeedService
 from app.market_data.freshness import MarketDataFreshnessError, ensure_fresh_bars
 from app.market_data.sessions import current_scan_window, is_regular_us_bar, is_regular_us_session
+from app.execution.paper_broker import AlpacaPaperError, PaperBroker
 from app.storage import Database
 
 
@@ -45,11 +46,15 @@ def is_completed_market_bar(
 
 
 class MarketMonitor:
-    def __init__(self, settings: Settings, db: Database, provider: AlpacaMarketData, feeds: ConfiguredFeedService):
+    def __init__(
+        self, settings: Settings, db: Database, provider: AlpacaMarketData,
+        feeds: ConfiguredFeedService, paper_broker: PaperBroker | None = None,
+    ):
         self.settings = settings
         self.db = db
         self.provider = provider
         self.feeds = feeds
+        self.paper_broker = paper_broker
         self._stop = asyncio.Event()
 
     async def run_forever(self) -> None:
@@ -91,6 +96,13 @@ class MarketMonitor:
             current = current.replace(tzinfo=UTC)
         current = current.astimezone(UTC)
         eastern_now = current.astimezone(_US_EASTERN)
+        if self.settings.alpaca_paper_trading_enabled and self.paper_broker is not None:
+            try:
+                self.paper_broker.sync_broker_positions()
+            except Exception as exc:
+                self.db.add_audit("alpaca_paper.position_sync_failed", {
+                    "reason": "session_close", "error_type": type(exc).__name__,
+                })
         portfolio = self.db.portfolio_snapshot(self.settings.paper_initial_equity)
         closed: list[dict[str, Any]] = []
 
@@ -121,6 +133,30 @@ class MarketMonitor:
                 )
             )
             if not due:
+                continue
+
+            if position.get("execution_mode") == "alpaca_paper":
+                # Alpaca's attached bracket orders own stop/target exits. At/after
+                # session end close through the paper Trading API, never at a stale local mark.
+                if self.paper_broker is None:
+                    self.db.add_audit("paper_position.session_close_skipped", {
+                        "position_id": position["id"], "reason": "paper_broker_not_available",
+                    })
+                    continue
+                try:
+                    result = self.paper_broker.close_position(
+                        str(position["id"]), reason="us_regular_session_close"
+                    )
+                    event = {
+                        **result, "symbol": position["symbol"],
+                        "closed_at_check": current.isoformat(), "mode": "alpaca_paper",
+                    }
+                    closed.append(event)
+                except Exception as exc:
+                    self.db.add_audit("paper_position.session_close_skipped", {
+                        "position_id": position["id"], "symbol": position["symbol"],
+                        "reason": "broker_close_not_confirmed", "error_type": type(exc).__name__,
+                    })
                 continue
 
             checkpoint = position.get("last_processed_bar_at") or position["opened_at"]
@@ -182,6 +218,14 @@ class MarketMonitor:
         return closed
 
     async def run_once(self) -> dict[str, Any]:
+        if self.settings.alpaca_paper_trading_enabled and self.paper_broker is not None:
+            try:
+                self.paper_broker.sync_broker_positions()
+            except Exception as exc:
+                self.db.add_audit("alpaca_paper.position_sync_failed", {
+                    "reason": "market_scan", "error_type": type(exc).__name__,
+                })
+
         symbols = (
             self.settings.autonomous_symbol_list
             if self.settings.autonomous_paper_trading_enabled
@@ -203,6 +247,9 @@ class MarketMonitor:
             checkpoints = self.db.list_open_position_backfill_starts(position_horizon)
             for checkpoint in checkpoints:
                 symbol = checkpoint["symbol"]
+                if checkpoint.get("execution_mode") == "alpaca_paper":
+                    # Broker-backed bracket orders are the only authority for exits.
+                    continue
                 try:
                     start_time = datetime.fromisoformat(
                         checkpoint["start_time"].replace("Z", "+00:00")
