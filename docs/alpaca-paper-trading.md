@@ -43,7 +43,7 @@ An Alpaca-backed position is different: the app sends a close through Alpaca Pap
 
 ## Intraday policy
 
-New entries and trade proposals are intraday-only. They use completed five-minute candles and are only eligible during the US regular session. The target/stop bracket is sent with the Alpaca parent entry order. The monitor tries to close Alpaca-backed intraday positions during the final five minutes before the calendar's scheduled close, while the regular session is still open; local-only simulations are marked closed at the scheduled close. This is best-effort, not a guarantee if Alpaca is unavailable or Trade is offline. Keep Trade running during the session: a local process cannot act while your PC/application is offline.
+New entries and trade proposals are intraday-only. They use completed five-minute candles and are only eligible during the NYSE regular session. All new approvals are blocked during the final ten minutes before the scheduled close. The target/stop bracket is sent with the Alpaca parent entry order. The monitor polls every 30 seconds during that final window and targets Alpaca-backed closes five minutes before the scheduled close; local-only simulations are marked closed at the scheduled close. This is best-effort, not a guarantee if Alpaca is unavailable or Trade is offline. Keep Trade running during the session: a local process cannot act while your PC/application is offline.
 
 The session gate uses the installed NYSE calendar package to include holidays and early closes. Its calendar is shipped with the installed dependency, not queried live; keep it updated. Do not rely on this app as unattended production trading software.
 
