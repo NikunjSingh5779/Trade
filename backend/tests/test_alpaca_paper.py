@@ -324,3 +324,128 @@ def test_autonomous_worker_keeps_proposal_pending_after_ambiguous_broker_write(t
     assert len(pending) == 1
     assert pending[0]["status"] == "pending"
     assert result["autonomous_trading"]["decision_outcomes"][0]["status"] == "broker_pending"
+
+
+
+def _prepare_unknown_intent(tmp_path):
+    settings = _settings(tmp_path)
+    db = Database(settings.database_path)
+    db.initialize(["AAPL"])
+    now = datetime.now(UTC)
+    proposal = db.add_proposal(_proposal_body(now.isoformat()))
+    client_order_id = PaperBroker._client_order_id(proposal["id"])
+    db.register_broker_order_intent(
+        proposal["id"], proposal["version"], client_order_id, "AAPL"
+    )
+    return settings, db, proposal, client_order_id
+
+
+def test_unknown_order_intent_requires_waiting_period(tmp_path, monkeypatch):
+    settings, db, proposal, client_order_id = _prepare_unknown_intent(tmp_path)
+    broker = PaperBroker(settings, db)
+    monkeypatch.setattr(broker.alpaca, "order_by_client_id", lambda client_id: None)
+    monkeypatch.setattr(broker.alpaca, "positions", lambda: [])
+
+    with pytest.raises(Exception, match="at least 120 seconds"):
+        broker.resolve_unknown_order_intent(
+            proposal["id"], confirmed_no_order_and_no_position=True
+        )
+
+    with db.connect() as conn:
+        intent = conn.execute(
+            "SELECT status FROM broker_order_intents WHERE proposal_id=?", (proposal["id"],)
+        ).fetchone()
+    assert intent["status"] == "submitting"
+
+
+def test_unknown_order_intent_requires_broker_order_absent(tmp_path, monkeypatch):
+    settings, db, proposal, client_order_id = _prepare_unknown_intent(tmp_path)
+    with db.connect() as conn:
+        old_time = (datetime.now(UTC) - timedelta(minutes=5)).isoformat()
+        conn.execute(
+            "UPDATE broker_order_intents SET created_at=?, updated_at=? WHERE proposal_id=?",
+            (old_time, old_time, proposal["id"]),
+        )
+    broker = PaperBroker(settings, db)
+    monkeypatch.setattr(broker.alpaca, "order_by_client_id", lambda client_id: {
+        "id": "found-order", "status": "filled", "client_order_id": client_order_id,
+    })
+    monkeypatch.setattr(broker.alpaca, "positions", lambda: [])
+
+    with pytest.raises(Exception, match="still returns an order"):
+        broker.resolve_unknown_order_intent(
+            proposal["id"], confirmed_no_order_and_no_position=True
+        )
+
+    with db.connect() as conn:
+        intent = conn.execute(
+            "SELECT status FROM broker_order_intents WHERE proposal_id=?", (proposal["id"],)
+        ).fetchone()
+    assert intent["status"] == "submitting"
+
+
+def test_unknown_order_intent_requires_no_broker_position(tmp_path, monkeypatch):
+    settings, db, proposal, client_order_id = _prepare_unknown_intent(tmp_path)
+    with db.connect() as conn:
+        old_time = (datetime.now(UTC) - timedelta(minutes=5)).isoformat()
+        conn.execute(
+            "UPDATE broker_order_intents SET created_at=?, updated_at=? WHERE proposal_id=?",
+            (old_time, old_time, proposal["id"]),
+        )
+    broker = PaperBroker(settings, db)
+    monkeypatch.setattr(broker.alpaca, "order_by_client_id", lambda client_id: None)
+    monkeypatch.setattr(broker.alpaca, "positions", lambda: [{
+        "symbol": "AAPL", "qty": "5", "side": "long",
+    }])
+
+    with pytest.raises(Exception, match="still reports a AAPL position"):
+        broker.resolve_unknown_order_intent(
+            proposal["id"], confirmed_no_order_and_no_position=True
+        )
+
+
+def test_unknown_order_intent_resolves_only_after_api_checks_and_confirmation(tmp_path, monkeypatch):
+    settings, db, proposal, client_order_id = _prepare_unknown_intent(tmp_path)
+    with db.connect() as conn:
+        old_time = (datetime.now(UTC) - timedelta(minutes=5)).isoformat()
+        conn.execute(
+            "UPDATE broker_order_intents SET created_at=?, updated_at=? WHERE proposal_id=?",
+            (old_time, old_time, proposal["id"]),
+        )
+    broker = PaperBroker(settings, db)
+    order_checks = []
+    position_checks = []
+    monkeypatch.setattr(
+        broker.alpaca, "order_by_client_id",
+        lambda client_id: order_checks.append(client_id) or None,
+    )
+    monkeypatch.setattr(broker.alpaca, "positions", lambda: position_checks.append(True) or [])
+
+    result = broker.resolve_unknown_order_intent(
+        proposal["id"], confirmed_no_order_and_no_position=True
+    )
+
+    assert result["status"] == "resolved_no_order"
+    assert result["proposal_status"] == "pending"
+    assert order_checks == [client_order_id]
+    assert position_checks == [True]
+    with db.connect() as conn:
+        intent = dict(conn.execute(
+            "SELECT status, last_error FROM broker_order_intents WHERE proposal_id=?",
+            (proposal["id"],),
+        ).fetchone())
+    assert intent["status"] == "resolved_no_order"
+    assert "Operator confirmed" in intent["last_error"]
+    assert db.get_proposal(proposal["id"])["status"] == "pending"
+
+    # A subsequent explicit approval reuses the same idempotent client order ID.
+    db.register_broker_order_intent(
+        proposal["id"], proposal["version"], client_order_id, "AAPL"
+    )
+    with db.connect() as conn:
+        retried = dict(conn.execute(
+            "SELECT status, client_order_id FROM broker_order_intents WHERE proposal_id=?",
+            (proposal["id"],),
+        ).fetchone())
+    assert retried["status"] == "submitting"
+    assert retried["client_order_id"] == client_order_id
