@@ -1,3 +1,4 @@
+import json
 from datetime import UTC, datetime, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -71,22 +72,46 @@ class PaperBroker:
         # before allowing any further entry for that account.
         with self.db.connect() as conn:
             pending_rows = conn.execute(
-                "SELECT id, version, body_json FROM proposals WHERE status='pending'"
+                "SELECT i.proposal_id AS id, i.proposal_version AS version, i.client_order_id, "
+                "i.status AS intent_status, i.broker_order_id, p.status AS proposal_status, "
+                "p.body_json FROM broker_order_intents i "
+                "JOIN proposals p ON p.id=i.proposal_id "
+                "WHERE i.status IN ('submitting','unknown') ORDER BY i.created_at"
             ).fetchall()
 
         for pending in pending_rows:
             proposal_id = str(pending["id"])
+            # A local row means the fill transaction completed; only the intent status update
+            # was interrupted. Reconcile it without another network write.
+            local_for_proposal = next(
+                (row for row in self._local_open_positions()
+                 if str(row.get("proposal_id")) == proposal_id
+                 and row.get("execution_mode") == "alpaca_paper"),
+                None,
+            )
+            if local_for_proposal is not None:
+                self.db.update_broker_order_intent(
+                    proposal_id, "recorded", broker_order_id=pending["broker_order_id"]
+                )
+                continue
             try:
-                body = __import__("json").loads(pending["body_json"])
+                body = json.loads(pending["body_json"])
                 symbol = str(body.get("symbol", "")).upper()
-                order = self.alpaca.order_by_client_id(self._client_order_id(proposal_id))
+                order = self.alpaca.order_by_client_id(str(pending["client_order_id"]))
             except AlpacaPaperError:
                 raise
             except (TypeError, ValueError, AttributeError):
-                issues.append(f"Pending proposal {proposal_id}: invalid proposal data prevents broker reconciliation")
+                issues.append(f"Pending broker intent {proposal_id}: invalid proposal data prevents reconciliation")
                 continue
             if not order:
-                # Most pending proposals have not been approved/submitted yet.
+                self.db.update_broker_order_intent(
+                    proposal_id, "unknown",
+                    last_error="No order is currently returned for the durable client order ID.",
+                )
+                issues.append(
+                    f"{symbol}: broker order outcome is still unknown; Alpaca has not returned the "
+                    "recorded client order ID. Verify the Alpaca Paper order list before retrying."
+                )
                 continue
 
             order_status = str(order.get("status", "")).lower()
@@ -103,17 +128,28 @@ class PaperBroker:
                     )
                     continue
                 try:
-                    rejected = self.db.reject_proposal(proposal_id, int(pending["version"]))
+                    proposal_status = str(pending["proposal_status"])
+                    if proposal_status == "pending":
+                        rejected = self.db.reject_proposal(proposal_id, int(pending["version"]))
+                        proposal_status = str(rejected.get("status"))
+                    self.db.update_broker_order_intent(
+                        proposal_id, "rejected", broker_order_id=str(order.get("id") or ""),
+                        last_error=f"Alpaca broker order status: {order_status}",
+                    )
                     self.db.add_audit("alpaca_paper.entry_reconciled_not_filled", {
                         "proposal_id": proposal_id, "symbol": symbol,
                         "broker_order_id": order.get("id"), "broker_status": order_status,
-                        "proposal_status": rejected.get("status"),
+                        "proposal_status": proposal_status,
                     })
                 except (KeyError, ValueError):
                     issues.append(f"{symbol}: terminal broker order found but proposal status could not be reconciled")
                 continue
 
             if order_status != "filled":
+                self.db.update_broker_order_intent(
+                    proposal_id, "unknown", broker_order_id=str(order.get("id") or ""),
+                    last_error=f"Alpaca order is not terminal: {order_status or 'unknown status'}",
+                )
                 issues.append(
                     f"{symbol}: Alpaca entry order is unresolved ({order_status or 'unknown status'}); "
                     "new entries are blocked until it finishes."
