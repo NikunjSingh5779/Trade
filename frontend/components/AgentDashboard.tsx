@@ -144,6 +144,7 @@ export default function AgentDashboard() {
   const execution = portfolio?.execution_status;
   const brokerMode = portfolio?.mode === "alpaca_paper";
   const localOnlyPositions = portfolio?.local_simulation_positions ?? [];
+  const brokerOfflinePositions = portfolio?.broker_backed_positions_pending_reconciliation ?? [];
   const displayedPositionCount = brokerMode
     ? (execution?.broker_position_count ?? portfolio?.open_positions.length ?? 0)
     : portfolio?.mode === "alpaca_paper_disconnected"
@@ -301,6 +302,11 @@ export default function AgentDashboard() {
               </table>
             </div>
           </Panel>
+          {brokerOfflinePositions.length > 0 && <Panel className="p-5">
+            <SectionTitle icon={CircleAlert} title="Alpaca positions pending reconciliation" note="Broker connection required"/>
+            <p className="mt-2 text-xs leading-5 text-amber-100">These positions were created through Alpaca Paper, but the broker API is currently unavailable or their current state could not be confirmed. Do not close them at a local mark. Reconnect Alpaca and confirm broker status first.</p>
+            <div className="mt-4 space-y-2">{brokerOfflinePositions.map(pos => <div key={pos.id} className="rounded-lg border border-[#2b3c54] bg-[#0a1220] p-3 text-xs"><strong>{pos.symbol} · {pos.side.toUpperCase()} · {pos.quantity} shares</strong><p className="mt-1 text-[#a8b5c8]">Recorded entry {money(pos.entry_price)} · last stored mark {money(pos.current_price)} · stop {money(pos.stop_loss)} · target {money(pos.take_profit)}</p></div>)}</div>
+          </Panel>}
           {localOnlyPositions.length > 0 && <Panel className="p-5">
             <SectionTitle icon={CircleAlert} title="Legacy local-only positions" note="Not in Alpaca"/>
             <p className="mt-2 text-xs leading-5 text-amber-100">These rows are local simulations from before Alpaca Paper routing was enabled. They are not broker holdings and are excluded from Alpaca equity/P&L. Review each before using “Close at mark”; that closes only the local simulation.</p>
