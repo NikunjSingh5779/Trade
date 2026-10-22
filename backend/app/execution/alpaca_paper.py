@@ -113,6 +113,25 @@ class AlpacaPaperTrading:
             raise AlpacaPaperError("Alpaca Paper positions response was not a list.")
         return body
 
+    def list_orders(
+        self, *, symbol: str, after: str, limit: int = 100
+    ) -> list[dict[str, Any]]:
+        """Query recent Paper orders for a symbol when reconciling an ambiguous close."""
+        body = self._request(
+            "GET", "/v2/orders",
+            params={
+                "status": "all",
+                "limit": max(1, min(int(limit), 500)),
+                "after": after,
+                "direction": "asc",
+                "nested": "false",
+                "symbols": symbol.upper(),
+            },
+        )
+        if not isinstance(body, list) or any(not isinstance(item, dict) for item in body):
+            raise AlpacaPaperError("Alpaca Paper orders response was not a list of order objects.")
+        return body
+
     def order_by_client_id(self, client_order_id: str) -> dict[str, Any] | None:
         body = self._request(
             "GET", "/v2/orders:by_client_order_id",
