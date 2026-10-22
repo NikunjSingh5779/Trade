@@ -96,15 +96,24 @@ async def test_timeframe_that_contradicts_the_request_is_rejected(tmp_path):
     assert db.list_proposals() == []
 
 
-async def test_omitted_timeframe_inherits_the_requested_one(tmp_path):
+async def test_omitted_timeframe_inherits_intraday_default(tmp_path):
     answer = _model_answer()
     del answer["timeframe"]
     db, worker = _worker(tmp_path, answer)
 
-    result = await worker._process("analyze_proposal", _payload(timeframe="swing"))
+    result = await worker._process("analyze_proposal", _payload(timeframe="intraday"))
 
-    assert result["proposal"]["timeframe"] == "swing"
-    assert result["proposal"]["data_timeframe"] == "swing"
+    assert result["proposal"]["timeframe"] == "intraday"
+    assert result["proposal"]["data_timeframe"] == "intraday"
+
+
+async def test_legacy_swing_analysis_job_is_rejected_before_inference(tmp_path):
+    db, worker = _worker(tmp_path, _model_answer())
+
+    with pytest.raises(ValueError, match="intraday proposal jobs only"):
+        await worker._process("analyze_proposal", _payload(timeframe="swing"))
+
+    assert db.list_proposals() == []
 
 
 async def test_no_setup_answer_creates_no_proposal(tmp_path):
