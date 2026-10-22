@@ -106,7 +106,7 @@ def test_autonomous_decision_opens_only_a_valid_paper_position(tmp_path, monkeyp
 def test_ambiguous_or_unapproved_symbol_fails_closed(tmp_path, monkeypatch):
     import app.execution.paper_broker as broker_module
 
-    monkeypatch.setattr(broker_module, "is_regular_us_session", lambda: True)
+    monkeypatch.setattr(broker_module, "is_regular_us_session", lambda now=None: True)
     monkeypatch.setattr(broker_module, "is_regular_us_bar", lambda bar: True)
     settings = _settings(tmp_path)
     db = Database(settings.database_path)
