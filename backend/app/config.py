@@ -32,7 +32,9 @@ class Settings(BaseSettings):
     )
     local_model_id: str = ""
     model_discovery_timeout_seconds: float = Field(default=3.0, ge=0.5, le=15)
-    ai_request_timeout_seconds: float = Field(default=180, ge=5, le=600)
+    ai_request_timeout_seconds: float = Field(default=300, ge=5, le=600)
+    ai_max_output_tokens: int = Field(default=8192, ge=1024, le=32768)
+    ai_reasoning_budget_tokens: int = Field(default=4096, ge=0, le=24576)
     ai_queue_max_pending: int = Field(default=100, ge=1, le=10000)
     inference_lock_path: str = ".agent_inference.lock"
 
@@ -102,6 +104,11 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def enforce_safety_defaults(self):
+        if self.ai_reasoning_budget_tokens >= self.ai_max_output_tokens:
+            raise ValueError(
+                "AI_REASONING_BUDGET_TOKENS must be below AI_MAX_OUTPUT_TOKENS "
+                "so the model has room to produce a final answer."
+            )
         if self.live_trading_enabled or self.allow_live_order_endpoints or not self.paper_trading_only:
             raise ValueError(
                 "This build is paper-only: PAPER_TRADING_ONLY=true, "
