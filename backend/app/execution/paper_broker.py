@@ -141,10 +141,19 @@ class PaperBroker:
                     "portfolio_value", "trading_blocked", "account_blocked", "shorting_enabled",
                 )
             }
+            broker_positions = []
+            for position in reconciliation.get("broker_positions", []):
+                broker_positions.append({
+                    key: position.get(key) for key in (
+                        "symbol", "qty", "side", "avg_entry_price", "current_price",
+                        "market_value", "cost_basis", "unrealized_pl", "unrealized_plpc",
+                    )
+                })
             return {
                 "mode": "alpaca_paper", "enabled": True, "connected": True,
                 "configured": True, "account": clean_account,
-                "broker_position_count": len(reconciliation.get("broker_positions", [])),
+                "broker_position_count": len(broker_positions),
+                "broker_positions": broker_positions,
                 "reconciled": reconciliation["reconciled"],
                 "issues": reconciliation["issues"],
                 "note": "Orders use the Alpaca Paper API only; no live endpoint is supported.",
