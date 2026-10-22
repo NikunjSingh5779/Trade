@@ -55,17 +55,149 @@ class PaperBroker:
         return filled[-1]
 
     def sync_broker_positions(self) -> dict[str, Any]:
-        """Reconcile locally tracked Alpaca positions to Alpaca's paper account truth."""
+        """Reconcile open holdings and recover entries whose broker response was ambiguous."""
         if not self.settings.alpaca_paper_trading_enabled:
             return {"connected": False, "reconciled": True, "issues": [], "mode": "local_simulation"}
+
         remote = self.alpaca.positions()
         remote_by_symbol = {str(row.get("symbol", "")).upper(): row for row in remote}
-        local = self._local_open_positions()
-        tracked = {str(row["symbol"]).upper(): row for row in local
-                   if row.get("execution_mode") == "alpaca_paper"}
         issues: list[str] = []
         synchronized: list[str] = []
         auto_closed: list[dict[str, Any]] = []
+        recovered: list[dict[str, Any]] = []
+
+        # If a POST succeeded at Alpaca but the HTTP response timed out before SQLite
+        # committed it, the proposal is still pending. Reconcile using its stable client ID
+        # before allowing any further entry for that account.
+        with self.db.connect() as conn:
+            pending_rows = conn.execute(
+                "SELECT id, version, body_json FROM proposals WHERE status='pending'"
+            ).fetchall()
+
+        for pending in pending_rows:
+            proposal_id = str(pending["id"])
+            try:
+                body = __import__("json").loads(pending["body_json"])
+                symbol = str(body.get("symbol", "")).upper()
+                order = self.alpaca.order_by_client_id(self._client_order_id(proposal_id))
+            except AlpacaPaperError:
+                raise
+            except (TypeError, ValueError, AttributeError):
+                issues.append(f"Pending proposal {proposal_id}: invalid proposal data prevents broker reconciliation")
+                continue
+            if not order:
+                # Most pending proposals have not been approved/submitted yet.
+                continue
+
+            order_status = str(order.get("status", "")).lower()
+            if order_status in {"rejected", "canceled", "expired"}:
+                filled_quantity = 0.0
+                try:
+                    filled_quantity = abs(float(order.get("filled_qty") or 0))
+                except (TypeError, ValueError):
+                    pass
+                if filled_quantity > 0:
+                    issues.append(
+                        f"{symbol}: Alpaca order ended as {order_status} after a partial fill; "
+                        "manual reconciliation is required."
+                    )
+                    continue
+                try:
+                    rejected = self.db.reject_proposal(proposal_id, int(pending["version"]))
+                    self.db.add_audit("alpaca_paper.entry_reconciled_not_filled", {
+                        "proposal_id": proposal_id, "symbol": symbol,
+                        "broker_order_id": order.get("id"), "broker_status": order_status,
+                        "proposal_status": rejected.get("status"),
+                    })
+                except (KeyError, ValueError):
+                    issues.append(f"{symbol}: terminal broker order found but proposal status could not be reconciled")
+                continue
+
+            if order_status != "filled":
+                issues.append(
+                    f"{symbol}: Alpaca entry order is unresolved ({order_status or 'unknown status'}); "
+                    "new entries are blocked until it finishes."
+                )
+                continue
+
+            try:
+                quantity = int(float(order.get("filled_qty") or order.get("qty") or 0))
+                fill_price = float(order.get("filled_avg_price") or 0)
+                order_id = str(order.get("id") or "")
+            except (TypeError, ValueError):
+                issues.append(f"{symbol}: filled Alpaca order has invalid quantity or price")
+                continue
+            if quantity < 1 or fill_price <= 0 or not order_id:
+                issues.append(f"{symbol}: filled Alpaca order is missing its confirmed quantity/price/ID")
+                continue
+
+            local_open = self._local_open_positions()
+            conflicting_local = [
+                row for row in local_open if str(row.get("symbol", "")).upper() == symbol
+            ]
+            if conflicting_local:
+                issues.append(
+                    f"{symbol}: a confirmed Alpaca fill conflicts with an existing local position; "
+                    "review before reconciling."
+                )
+                continue
+
+            broker_position = remote_by_symbol.get(symbol)
+            if broker_position is None:
+                exit_leg = self._confirmed_bracket_exit({"proposal_id": proposal_id})
+                if not exit_leg:
+                    issues.append(
+                        f"{symbol}: entry order is filled but no broker position or confirmed bracket exit is visible"
+                    )
+                    continue
+                try:
+                    exit_price = float(exit_leg["filled_avg_price"])
+                    recorded = self.db.record_recovered_alpaca_paper_trade(
+                        proposal_id, int(pending["version"]), quantity, fill_price, order_id
+                    )
+                    closed = self.db.close_position(recorded["position_id"], exit_price)
+                    event = {
+                        **closed, "symbol": symbol, "reason": str(exit_leg.get("type") or "alpaca_bracket_exit"),
+                        "broker_order_id": exit_leg.get("id"), "mode": "alpaca_paper",
+                        "recovered_after_ambiguous_response": True,
+                    }
+                    self.db.add_audit("alpaca_paper.entry_and_exit_reconciled", event)
+                    auto_closed.append(event)
+                    recovered.append({"symbol": symbol, "position_id": recorded["position_id"], "status": "closed"})
+                except (KeyError, ValueError, TypeError) as exc:
+                    issues.append(f"{symbol}: could not recover broker entry/exit ({type(exc).__name__})")
+                continue
+
+            try:
+                remote_quantity = abs(float(broker_position.get("qty", 0)))
+                remote_side = str(broker_position.get("side", "")).lower()
+                expected_side = "long" if str(body.get("side", "")).lower() == "long" else "short"
+                if remote_side != expected_side or abs(remote_quantity - quantity) > 1e-6:
+                    issues.append(
+                        f"{symbol}: filled order and broker position quantity/side differ; manual review required"
+                    )
+                    continue
+                recorded = self.db.record_recovered_alpaca_paper_trade(
+                    proposal_id, int(pending["version"]), quantity, fill_price, order_id
+                )
+                event = {
+                    "symbol": symbol, "position_id": recorded["position_id"],
+                    "broker_order_id": order_id, "quantity": quantity,
+                    "fill_price": fill_price, "mode": "alpaca_paper",
+                }
+                self.db.add_audit("alpaca_paper.entry_recovered", event)
+                recovered.append({"symbol": symbol, "position_id": recorded["position_id"], "status": "open"})
+            except (KeyError, ValueError, TypeError) as exc:
+                issues.append(f"{symbol}: could not record confirmed broker entry ({type(exc).__name__})")
+
+        # Reload because the recovery pass can add positions or reconcile bracket exits.
+        remote = self.alpaca.positions()
+        remote_by_symbol = {str(row.get("symbol", "")).upper(): row for row in remote}
+        local = self._local_open_positions()
+        tracked = {
+            str(row["symbol"]).upper(): row for row in local
+            if row.get("execution_mode") == "alpaca_paper"
+        }
 
         for position in local:
             symbol = str(position["symbol"]).upper()
@@ -119,6 +251,7 @@ class PaperBroker:
             "broker_positions": remote,
             "synchronized_symbols": synchronized,
             "auto_closed": auto_closed,
+            "recovered_entries": recovered,
             "mode": "alpaca_paper",
         }
 
