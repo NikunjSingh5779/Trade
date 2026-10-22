@@ -232,13 +232,17 @@ class MarketMonitor:
                     except (KeyError, TypeError, ValueError):
                         continue
                     if (
-                        bounds is None
+                        stamp <= opened_at.astimezone(UTC)
+                        or bounds is None
                         or stamp < bounds[1] - timedelta(minutes=5)
                         or stamp >= bounds[1]
+                        or bounds[1] > current
                         or close_price <= 0
                     ):
                         continue
-                    if verified_close_stamp is None or stamp > verified_close_stamp:
+                    # When recovering multiple missed sessions, flatten at the first
+                    # verified session close after entry, not a later date's stale/future close.
+                    if verified_close_stamp is None or stamp < verified_close_stamp:
                         verified_close_bar = bar
                         verified_close_stamp = stamp
 
