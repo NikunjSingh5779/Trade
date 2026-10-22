@@ -129,7 +129,14 @@ export default function AgentDashboard() {
   }
 
   const pending = proposals.filter(p => p.status === "pending");
-  const latestResponse = jobs.find(j => j.status === "succeeded" && j.result?.text);
+  const latestResponse = jobs.find(
+    j => j.status === "succeeded" && j.result?.text && j.task !== "market_scan"
+  );
+  const latestAutonomousScan = jobs.find(
+    j => j.task === "market_scan" && j.status === "succeeded" && j.result?.autonomous_trading
+  );
+  const autonomousResult = latestAutonomousScan?.result?.autonomous_trading;
+  const latestScanAttempt = jobs.find(j => j.task === "market_scan");
   const localModel = inference?.local_endpoints?.[0]?.model_id;
 
   return (
@@ -196,6 +203,41 @@ export default function AgentDashboard() {
                 <button disabled={busy === "chat" || !message.trim()} className="flex items-center gap-2 rounded-xl bg-[#75e0b2] px-4 py-2.5 text-sm font-semibold text-[#082019] hover:bg-[#94f0c7] disabled:opacity-50"><Send size={15}/> {busy === "chat" ? "Queuing…" : "Send request"}</button>
               </div>
             </form>
+            {market?.autonomous_paper_trading_enabled && <div className="mt-5 rounded-xl border border-[#29384d] bg-[#0a1220] p-4">
+              <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+                <div className="flex items-center gap-2 text-xs font-semibold text-[#75e0b2]"><Activity size={14}/> Latest autonomous scan outcome</div>
+                <span className="text-[10px] text-[#71819a]">{latestAutonomousScan ? latestAutonomousScan.id : latestScanAttempt ? `Latest scan: ${latestScanAttempt.status}` : "No scan yet"}</span>
+              </div>
+              {autonomousResult ? <>
+                <div className="grid grid-cols-3 gap-2">
+                  <div className="rounded-lg border border-[#243246] bg-[#0f1725] p-3">
+                    <div className="text-[10px] uppercase text-[#8e9cb2]">Paper entries</div>
+                    <div className="mt-1 text-xl font-semibold text-[#95f0c9]">{autonomousResult.paper_trades_opened ?? 0}</div>
+                  </div>
+                  <div className="rounded-lg border border-[#243246] bg-[#0f1725] p-3">
+                    <div className="text-[10px] uppercase text-[#8e9cb2]">No trade</div>
+                    <div className="mt-1 text-xl font-semibold">{autonomousResult.explicit_no_trade ?? 0}</div>
+                  </div>
+                  <div className="rounded-lg border border-[#243246] bg-[#0f1725] p-3">
+                    <div className="text-[10px] uppercase text-[#8e9cb2]">Skipped</div>
+                    <div className="mt-1 text-xl font-semibold">{autonomousResult.decisions_skipped ?? 0}</div>
+                  </div>
+                </div>
+                {autonomousResult.status !== "processed" && <p className="mt-3 text-xs text-amber-200">Scan outcome: {autonomousResult.status}. No automated entry was confirmed.</p>}
+                <div className="mt-3 space-y-2">
+                  {(autonomousResult.decision_outcomes ?? []).map((outcome, index) => <div key={`${outcome.symbol}-${index}`} className="flex flex-col gap-1 rounded-lg border border-[#243246] bg-[#0f1725] p-3 sm:flex-row sm:items-start sm:justify-between">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <span className="text-xs font-semibold text-[#e4ebf6]">{outcome.symbol}</span>
+                      {outcome.side && <span className={`rounded px-1.5 py-0.5 text-[10px] uppercase ${outcome.side === "long" ? "bg-[#143a30] text-[#8ee9c4]" : "bg-[#3a242b] text-[#ffb0ba]"}`}>{outcome.side}</span>}
+                      <span className={`rounded px-1.5 py-0.5 text-[10px] font-semibold uppercase ${outcome.status === "opened" ? "bg-[#143a30] text-[#8ee9c4]" : outcome.status === "skipped" ? "bg-amber-950/50 text-amber-200" : "bg-[#1a2637] text-[#a8b5c8]"}`}>{outcome.status === "opened" ? "Paper position opened" : outcome.status === "no_trade" ? "No trade" : outcome.status}</span>
+                      {outcome.quantity && outcome.simulated_price && <span className="text-[10px] text-[#8e9cb2]">{outcome.quantity} shares · simulated {money(outcome.simulated_price)}</span>}
+                    </div>
+                    {outcome.reason && <p className="text-xs leading-5 text-[#8e9cb2]">{outcome.reason}</p>}
+                  </div>)}
+                </div>
+                <p className="mt-3 text-[10px] leading-4 text-[#71819a]">Only entries listed as “Paper position opened” were created. AI suggestions alone are not fills. Everything shown here is simulated.</p>
+              </> : <p className="text-xs leading-5 text-[#8e9cb2]">{latestScanAttempt?.status === "failed" ? `The latest market scan failed: ${latestScanAttempt.error ?? "check the backend terminal for details"}` : "Waiting for a completed autonomous scan with an execution summary. The raw AI answer alone does not prove a paper trade was opened."}</p>}
+            </div>}
             {latestResponse && <div className="mt-5 rounded-xl border border-[#29384d] bg-[#0a1220] p-4">
               <div className="mb-2 flex items-center gap-2 text-xs font-semibold text-[#75e0b2]"><Sparkles size={14}/> Latest completed response <span className="text-[#71819a]">· {latestResponse.result?.provider?.model_id ?? latestResponse.result?.provider?.provider ?? "model"}</span></div>
               <p className="whitespace-pre-wrap text-sm leading-6 text-[#cbd6e7]">{latestResponse.result?.text}</p>
