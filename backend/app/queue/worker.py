@@ -103,6 +103,7 @@ class QueueWorker:
             })
             result["autonomous_trading"] = {
                 "status": "invalid_model_output", "paper_trades_opened": 0,
+                "decision_outcomes": [],
             }
             return
 
@@ -111,6 +112,7 @@ class QueueWorker:
             self.db.add_audit("autonomous_scan.invalid_payload", {"reason": "bars_by_symbol_missing"})
             result["autonomous_trading"] = {
                 "status": "invalid_payload", "paper_trades_opened": 0,
+                "decision_outcomes": [],
             }
             return
 
@@ -127,12 +129,17 @@ class QueueWorker:
         opened = 0
         skipped = 0
         explicit_no_trade = 0
+        decision_outcomes: list[dict[str, Any]] = []
 
         for decision in decisions:
             symbol = str(decision.get("symbol", "")).strip().upper()
             if symbol not in allowed_symbols or symbol not in supplied_symbols:
                 self.db.add_audit("autonomous_scan.symbol_rejected", {
                     "symbol": symbol[:12], "reason": "symbol_not_in_current_autonomous_universe",
+                })
+                decision_outcomes.append({
+                    "symbol": symbol or "UNKNOWN", "decision": "unknown",
+                    "status": "skipped", "reason": "Symbol is outside the configured universe or current scan.",
                 })
                 skipped += 1
                 continue
@@ -141,20 +148,32 @@ class QueueWorker:
                 self.db.add_audit("autonomous_scan.symbol_rejected", {
                     "symbol": symbol, "reason": "duplicate_model_decisions",
                 })
+                decision_outcomes.append({
+                    "symbol": symbol, "decision": "ambiguous",
+                    "status": "skipped", "reason": "The model returned multiple decisions for this symbol.",
+                })
                 skipped += 1
                 continue
 
             action = str(decision.get("decision", "")).strip().lower()
             if action == "no_trade":
+                reason = str(decision.get("reason", "Model found no defensible setup."))[:300]
                 self.db.add_audit("autonomous_scan.no_trade", {
-                    "symbol": symbol,
-                    "reason": str(decision.get("reason", "Model found no defensible setup."))[:300],
+                    "symbol": symbol, "reason": reason,
+                })
+                decision_outcomes.append({
+                    "symbol": symbol, "decision": "no_trade",
+                    "status": "no_trade", "reason": reason,
                 })
                 explicit_no_trade += 1
                 continue
             if action != "trade":
                 self.db.add_audit("autonomous_scan.symbol_rejected", {
                     "symbol": symbol, "reason": "decision_must_be_trade_or_no_trade",
+                })
+                decision_outcomes.append({
+                    "symbol": symbol, "decision": action[:24],
+                    "status": "skipped", "reason": "Decision must be trade or no_trade.",
                 })
                 skipped += 1
                 continue
@@ -202,6 +221,13 @@ class QueueWorker:
                     "simulated_price": execution["simulated_price"],
                     "mode": "paper",
                 })
+                decision_outcomes.append({
+                    "symbol": symbol, "decision": "trade", "status": "opened",
+                    "side": proposal.side,
+                    "quantity": execution["quantity"],
+                    "simulated_price": execution["simulated_price"],
+                    "reason": str(proposal.thesis)[:240],
+                })
                 opened += 1
             except (ValidationError, ValueError, TypeError, KeyError, RuntimeError) as exc:
                 if saved_proposal is not None:
@@ -211,11 +237,16 @@ class QueueWorker:
                         )
                     except (KeyError, ValueError):
                         pass
+                reason = str(exc).replace("\\n", " ")[:300]
                 self.db.add_audit("autonomous_trade.skipped", {
                     "symbol": symbol,
                     "proposal_id": saved_proposal.get("id") if saved_proposal else None,
                     "error_type": type(exc).__name__,
-                    "reason": str(exc).replace("\\n", " ")[:300],
+                    "reason": reason,
+                })
+                decision_outcomes.append({
+                    "symbol": symbol, "decision": "trade",
+                    "status": "skipped", "reason": reason,
                 })
                 skipped += 1
             except Exception as exc:
@@ -233,12 +264,20 @@ class QueueWorker:
                     "proposal_id": saved_proposal.get("id") if saved_proposal else None,
                     "error_type": type(exc).__name__,
                 })
+                decision_outcomes.append({
+                    "symbol": symbol, "decision": "trade",
+                    "status": "skipped", "reason": f"Internal validation/execution error: {type(exc).__name__}.",
+                })
                 skipped += 1
 
         missing_symbols = supplied_symbols - set(counts)
         for symbol in sorted(missing_symbols):
             self.db.add_audit("autonomous_scan.no_trade", {
                 "symbol": symbol, "reason": "No unambiguous decision returned; failed closed.",
+            })
+            decision_outcomes.append({
+                "symbol": symbol, "decision": "no_trade",
+                "status": "no_trade", "reason": "No unambiguous model decision was returned; failed closed.",
             })
             explicit_no_trade += 1
 
@@ -248,4 +287,5 @@ class QueueWorker:
             "explicit_no_trade": explicit_no_trade,
             "paper_trades_opened": opened,
             "decisions_skipped": skipped,
+            "decision_outcomes": decision_outcomes,
         }

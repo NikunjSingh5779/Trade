@@ -15,9 +15,30 @@ export async function api<T>(path: string, init?: RequestInit): Promise<T> {
   return data as T;
 }
 
+export type AutonomousDecisionOutcome = {
+  symbol: string;
+  decision: string;
+  status: "opened" | "no_trade" | "skipped" | string;
+  side?: "long" | "short" | string;
+  quantity?: number;
+  simulated_price?: number;
+  reason?: string;
+};
+export type AutonomousTradingSummary = {
+  status: string;
+  symbols_evaluated?: number;
+  explicit_no_trade?: number;
+  paper_trades_opened?: number;
+  decisions_skipped?: number;
+  decision_outcomes?: AutonomousDecisionOutcome[];
+};
 export type Job = {
   id: string; task: string; status: string; created_at: string;
-  result?: { text?: string; task?: string; provider?: { provider?: string; model_id?: string } } | null;
+  result?: {
+    text?: string; task?: string;
+    provider?: { provider?: string; model_id?: string };
+    autonomous_trading?: AutonomousTradingSummary;
+  } | null;
   error?: string | null;
 };
 export type Proposal = {
