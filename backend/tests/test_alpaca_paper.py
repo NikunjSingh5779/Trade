@@ -593,7 +593,7 @@ def test_close_intent_resolution_requires_wait_period(tmp_path, monkeypatch):
 
 
 def test_duplicate_unresolved_broker_intent_cannot_be_registered_twice(tmp_path):
-    settings, db, proposal, client_order_id = _prepare_unknown_intent(tmp_path)
+    _settings, db, proposal, client_order_id = _prepare_unknown_intent(tmp_path)
 
     with pytest.raises(ValueError, match="submission for this proposal is unresolved"):
         db.register_broker_order_intent(
