@@ -111,10 +111,11 @@ class MarketMonitor:
     async def close_intraday_positions_after_session(
         self, now: datetime | None = None
     ) -> list[dict[str, Any]]:
-        """Close overdue intraday paper positions using the last available regular-session mark.
+        """Close overdue intraday positions using verified local bars or confirmed broker fills.
 
-        The routine also catches positions left open because the app was offline at 16:00 ET.
-        It backfills completed regular-session candles before flattening any position that remains.
+        Broker-backed positions are flattened before the scheduled NYSE close. Local simulations
+        require a verified final regular-session candle, including on early-close sessions.
+        The routine also attempts to recover positions left open while the app was offline.
         """
         current = now or datetime.now(UTC)
         if current.tzinfo is None:
