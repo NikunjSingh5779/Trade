@@ -15,7 +15,7 @@ NEW_YORK = ZoneInfo("America/New_York")
 
 
 class PaperBroker:
-    """Local simulated broker. Intentionally contains no live-order methods."""
+    """Local simulation by default; optional Alpaca Paper routing only, never live orders."""
 
     def __init__(self, settings: Settings, db: Database):
         self.settings = settings
@@ -25,7 +25,7 @@ class PaperBroker:
     @staticmethod
     def _client_order_id(proposal_id: str) -> str:
         # Stable ID makes an approval retry idempotent at Alpaca as well as in SQLite.
-        return ("trade-" + "".join(ch for ch in proposal_id if ch.isalnum() or ch == "-") )[:48]
+        return ("trade-" + "".join(ch for ch in proposal_id if ch.isalnum() or ch == "-"))[:48]
 
     def _local_open_positions(self) -> list[dict[str, Any]]:
         with self.db.connect() as conn:
