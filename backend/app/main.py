@@ -303,7 +303,7 @@ async def portfolio() -> dict[str, Any]:
         return {
             **local, "mode": "local_simulation",
             "execution_status": paper_broker.execution_status(),
-            "local_simulation_positions": local["open_positions"],
+            "local_simulation_positions": [],
             "broker_positions": [],
         }
 
