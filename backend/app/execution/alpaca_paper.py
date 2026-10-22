@@ -25,6 +25,10 @@ class AlpacaOrderOutcomeUnknown(AlpacaPaperError):
     """A write may have reached Alpaca but its final outcome was not confirmed."""
 
 
+class AlpacaOrderRejected(AlpacaPaperError):
+    """Alpaca definitively rejected or canceled the order."""
+
+
 class AlpacaPaperTrading:
     def __init__(self, settings: Settings):
         self.settings = settings
@@ -70,6 +74,15 @@ class AlpacaPaperTrading:
                 raise AlpacaOrderOutcomeUnknown(
                     f"Alpaca Paper returned HTTP {response.status_code} to a write request; "
                     "the result may be ambiguous. Reconcile by client order ID before retrying."
+                )
+            if method.upper() == "POST" and response.status_code in {400, 409, 422}:
+                try:
+                    failed_body = response.json()
+                    reason = failed_body.get("message") or failed_body.get("code") or "order rejected"
+                except (ValueError, AttributeError):
+                    reason = "order rejected"
+                raise AlpacaOrderRejected(
+                    f"Alpaca Paper rejected the order (HTTP {response.status_code}): {str(reason)[:240]}"
                 )
             try:
                 body = response.json()
@@ -135,7 +148,9 @@ class AlpacaPaperTrading:
                 return latest
             if status in {"rejected", "canceled", "expired", "replaced"}:
                 message = latest.get("reject_reason") or status
-                raise AlpacaPaperError(f"Alpaca Paper order did not fill: {str(message)[:200]}.")
+                raise AlpacaOrderRejected(
+                    f"Alpaca Paper order did not fill: {str(message)[:200]}."
+                )
             time.sleep(0.5)
             latest = self.order_by_id(order_id)
         raise AlpacaOrderOutcomeUnknown(
