@@ -501,6 +501,18 @@ class Database:
                 if existing["client_order_id"] != client_order_id:
                     conn.rollback()
                     raise ValueError("Proposal already has a different broker order intent.")
+                if existing["status"] in {"submitting", "unknown"}:
+                    conn.rollback()
+                    raise ValueError(
+                        "A broker order submission for this proposal is unresolved; "
+                        "reconcile its existing client order ID before retrying."
+                    )
+                if existing["status"] in {"recorded", "recovered", "rejected"}:
+                    conn.rollback()
+                    raise ValueError(
+                        f"Broker order intent is already terminal ({existing['status']}); "
+                        "do not submit this proposal again."
+                    )
                 if existing["status"] in {"failed", "resolved_no_order"}:
                     conn.execute(
                         "UPDATE broker_order_intents SET status='submitting',last_error=NULL,updated_at=? "
