@@ -23,6 +23,28 @@ def _db_with_open_position(path):
     return db
 
 
+def test_inference_status_reports_effective_generation_settings(monkeypatch):
+    async def fake_status():
+        return {
+            "local_available": True,
+            "local_endpoints": [{"base_url": "http://127.0.0.1:8080/v1", "model_id": "test-model"}],
+            "hosted_fallback_enabled": False,
+            "selected_mode": "local",
+            "inference_concurrency_limit": 1,
+            "max_output_tokens": 8192,
+            "reasoning_budget_tokens": 4096,
+            "request_timeout_seconds": 300,
+        }
+
+    monkeypatch.setattr(main.router, "status", fake_status)
+    response = TestClient(main.app).get("/api/inference/status")
+
+    assert response.status_code == 200
+    assert response.json()["max_output_tokens"] == 8192
+    assert response.json()["reasoning_budget_tokens"] == 4096
+    assert response.json()["request_timeout_seconds"] == 300
+
+
 def test_untrusted_host_is_rejected():
     client = TestClient(main.app)
     response = client.get("/api/health", headers={"host": "attacker.example"})

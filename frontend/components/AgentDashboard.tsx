@@ -16,6 +16,7 @@ type Health = {
 type InferenceStatus = {
   local_available: boolean; local_endpoints: Array<{ base_url: string; model_id: string }>;
   hosted_fallback_enabled: boolean; selected_mode: string; inference_concurrency_limit: number;
+  max_output_tokens?: number; reasoning_budget_tokens?: number; request_timeout_seconds?: number;
 };
 type MarketStatus = {
   enabled: boolean; interval_seconds: number; provider_configured: boolean; regular_us_session: boolean;
@@ -293,6 +294,9 @@ export default function AgentDashboard() {
                 ["Local model", localModel ?? (inference?.selected_mode === "hosted" ? "Hosted fallback" : "Not detected"), Boolean(inference?.local_available)],
                 ["Market data credentials", market?.provider_configured ? "Configured" : "Not configured", Boolean(market?.provider_configured)],
                 ["Market session", market?.regular_us_session ? "Regular session" : "Outside regular hours", Boolean(market?.regular_us_session)],
+                ["AI generation budget", inference?.max_output_tokens != null
+                  ? `${inference.max_output_tokens.toLocaleString()} max output · ${inference.reasoning_budget_tokens?.toLocaleString() ?? "—"} reasoning · ${inference.request_timeout_seconds ?? "—"}s timeout`
+                  : "Waiting for backend settings", inference?.max_output_tokens != null],
                 ["Hosted fallback", inference?.hosted_fallback_enabled ? "Enabled by configuration" : "Disabled", !inference?.hosted_fallback_enabled],
               ].map(([name,value,ok]) => <div key={String(name)} className="flex items-center justify-between gap-3 border-b border-[#202d40] pb-3 last:border-0 last:pb-0"><div><div className="text-sm">{name}</div><div className="mt-1 text-xs text-[#71819a]">{String(value ?? "Checking…")}</div></div><span className={`h-2 w-2 rounded-full ${ok ? "bg-[#75e0b2]" : "bg-amber-400"}`}/></div>)}
             </div>
@@ -300,7 +304,9 @@ export default function AgentDashboard() {
               <div className="flex items-center gap-2 text-xs font-semibold text-[#75e0b2]"><ShieldCheck size={14}/> Safety invariants</div>
               <ul className="mt-2 space-y-2 text-xs text-[#9baac0]">
                 <li className="flex gap-2"><Check size={13} className="shrink-0 text-[#75e0b2]"/> One active AI inference request globally</li>
-                <li className="flex gap-2"><Check size={13} className="shrink-0 text-[#75e0b2]"/> Every new position requires explicit approval</li>
+                <li className="flex gap-2"><Check size={13} className="shrink-0 text-[#75e0b2]"/>{market?.autonomous_paper_trading_enabled
+                  ? "Automated entries still require backend risk checks; manual proposals require approval"
+                  : "New positions require explicit manual approval"}</li>
                 <li className="flex gap-2"><Check size={13} className="shrink-0 text-[#75e0b2]"/> Live order execution is not implemented</li>
                 <li className="flex gap-2"><Check size={13} className="shrink-0 text-[#75e0b2]"/> Strategy promotion is manual only</li>
               </ul>
