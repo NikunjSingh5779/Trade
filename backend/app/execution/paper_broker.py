@@ -85,13 +85,14 @@ class PaperBroker:
             proposal_id = str(pending["id"])
             # A local row means the fill transaction completed; only the intent status update
             # was interrupted. Reconcile it without another network write.
-            local_for_proposal = next(
-                (row for row in self._local_open_positions()
-                 if str(row.get("proposal_id")) == proposal_id
-                 and row.get("execution_mode") == "alpaca_paper"),
-                None,
-            )
+            with self.db.connect() as conn:
+                local_for_proposal = conn.execute(
+                    "SELECT id,status FROM positions WHERE proposal_id=? AND execution_mode='alpaca_paper'",
+                    (proposal_id,),
+                ).fetchone()
             if local_for_proposal is not None:
+                # This covers both open and already-closed positions if the app crashed
+                # after recording the fill but before updating its intent status.
                 self.db.update_broker_order_intent(
                     proposal_id, "recorded", broker_order_id=pending["broker_order_id"]
                 )
