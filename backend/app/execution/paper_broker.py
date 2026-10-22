@@ -101,7 +101,11 @@ class PaperBroker:
                     issues.append(f"{symbol}: share quantity/side differs between app and Alpaca")
                     continue
                 mark = float(broker_position.get("current_price", position["current_price"]))
-                self.db.mark_position(symbol, mark)
+                with self.db.connect() as conn:
+                    conn.execute(
+                        "UPDATE positions SET current_price=? WHERE id=? AND status='open'",
+                        (mark, position["id"]),
+                    )
                 synchronized.append(symbol)
             except (TypeError, ValueError):
                 issues.append(f"{symbol}: broker position has invalid quantity or mark")
