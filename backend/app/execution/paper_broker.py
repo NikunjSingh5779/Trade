@@ -38,6 +38,12 @@ class PaperBroker:
         if not order:
             return None
         legs = order.get("legs")
+        if not isinstance(legs, list) and order.get("id"):
+            try:
+                order = self.alpaca.order_by_id(str(order["id"]))
+                legs = order.get("legs")
+            except AlpacaPaperError:
+                return None
         if not isinstance(legs, list):
             return None
         filled = [leg for leg in legs if isinstance(leg, dict)
