@@ -300,6 +300,102 @@ class PaperBroker:
             "mode": "alpaca_paper",
         }
 
+    def resolve_unknown_order_intent(
+        self, proposal_id: str, *, confirmed_no_order_and_no_position: bool
+    ) -> dict[str, Any]:
+        """Release a stale unknown intent only after explicit operator confirmation and live Paper API checks."""
+        if not self.settings.alpaca_paper_trading_enabled or not self.alpaca.configured:
+            raise RiskRejected("Enable and connect Alpaca Paper before resolving a broker intent.")
+        if confirmed_no_order_and_no_position is not True:
+            raise RiskRejected(
+                "Explicit confirmation that the order and position are absent from Alpaca Paper is required."
+            )
+
+        with self.db.connect() as conn:
+            row = conn.execute(
+                "SELECT i.*, p.status AS proposal_status, p.body_json "
+                "FROM broker_order_intents i JOIN proposals p ON p.id=i.proposal_id "
+                "WHERE i.proposal_id=?",
+                (proposal_id,),
+            ).fetchone()
+        if row is None:
+            raise KeyError("No broker order intent exists for this proposal.")
+        intent = dict(row)
+        if intent["status"] not in {"submitting", "unknown"}:
+            raise ValueError(
+                f"Intent status is {intent['status']!r}; only submitting/unknown intents can be resolved."
+            )
+
+        try:
+            created_at = datetime.fromisoformat(
+                str(intent["created_at"]).replace("Z", "+00:00")
+            )
+            if created_at.tzinfo is None:
+                created_at = created_at.replace(tzinfo=UTC)
+        except (TypeError, ValueError) as exc:
+            raise RiskRejected(
+                "Broker intent has no valid creation timestamp; it needs manual database review."
+            ) from exc
+        age_seconds = (datetime.now(UTC) - created_at.astimezone(UTC)).total_seconds()
+        if age_seconds < 120:
+            raise RiskRejected(
+                "Wait at least 120 seconds after the ambiguous request before resolving it; "
+                "this reduces the chance of retrying an order whose response is delayed."
+            )
+
+        existing_order = self.alpaca.order_by_client_id(str(intent["client_order_id"]))
+        if existing_order is not None:
+            raise RiskRejected(
+                "Alpaca still returns an order for this client ID "
+                f"(status={str(existing_order.get('status') or 'unknown')}). "
+                "Do not release this intent; let broker reconciliation handle it."
+            )
+
+        symbol = str(intent["symbol"]).upper()
+        if any(str(position.get("symbol", "")).upper() == symbol
+               for position in self.alpaca.positions()):
+            raise RiskRejected(
+                f"Alpaca Paper still reports a {symbol} position. Do not release this intent."
+            )
+
+        for position in self._local_open_positions():
+            if str(position.get("symbol", "")).upper() == symbol:
+                raise RiskRejected(
+                    f"The local ledger still has an open {symbol} position. Review and reconcile it first."
+                )
+
+        with self.db.connect() as conn:
+            other = conn.execute(
+                "SELECT proposal_id FROM broker_order_intents "
+                "WHERE symbol=? AND proposal_id<>? AND status IN ('submitting','unknown') LIMIT 1",
+                (symbol, proposal_id),
+            ).fetchone()
+        if other is not None:
+            raise RiskRejected(
+                f"Another unresolved {symbol} broker intent exists; resolve it first."
+            )
+
+        self.db.update_broker_order_intent(
+            proposal_id, "resolved_no_order",
+            last_error="Operator confirmed no order/position in Alpaca Paper after API checks.",
+        )
+        self.db.add_audit("alpaca_paper.intent_resolved_no_order", {
+            "proposal_id": proposal_id,
+            "symbol": symbol,
+            "operator_confirmed_no_order_and_no_position": True,
+            "age_seconds": int(age_seconds),
+        })
+        return {
+            "proposal_id": proposal_id,
+            "symbol": symbol,
+            "status": "resolved_no_order",
+            "proposal_status": intent["proposal_status"],
+            "note": (
+                "No order or position was found in Alpaca Paper and the operator confirmed the dashboard check. "
+                "A subsequent approval will reuse the same client order ID."
+            ),
+        }
+
     def execution_status(self) -> dict[str, Any]:
         if not self.settings.alpaca_paper_trading_enabled:
             local = self._local_open_positions()
@@ -323,6 +419,14 @@ class PaperBroker:
                     "portfolio_value", "trading_blocked", "account_blocked", "shorting_enabled",
                 )
             }
+            with self.db.connect() as conn:
+                unresolved_rows = conn.execute(
+                    "SELECT i.proposal_id, i.symbol, i.status, i.created_at, "
+                    "p.status AS proposal_status FROM broker_order_intents i "
+                    "JOIN proposals p ON p.id=i.proposal_id "
+                    "WHERE i.status IN ('submitting','unknown') ORDER BY i.created_at"
+                ).fetchall()
+            unresolved_intents = [dict(row) for row in unresolved_rows]
             broker_positions = []
             for position in reconciliation.get("broker_positions", []):
                 broker_positions.append({
@@ -338,6 +442,7 @@ class PaperBroker:
                 "broker_positions": broker_positions,
                 "reconciled": reconciliation["reconciled"],
                 "issues": reconciliation["issues"],
+                "unresolved_intents": unresolved_intents,
                 "note": "Orders use the Alpaca Paper API only; no live endpoint is supported.",
             }
         except AlpacaPaperError as exc:
