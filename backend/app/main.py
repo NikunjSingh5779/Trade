@@ -290,9 +290,69 @@ async def reject_proposal(proposal_id: str, request: RejectRequest) -> dict[str,
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
+@app.get("/api/execution/status")
+async def execution_status() -> dict[str, Any]:
+    """Broker/mode status. The adapter can connect only to Alpaca Paper, never live."""
+    return paper_broker.execution_status()
+
+
 @app.get("/api/portfolio")
 async def portfolio() -> dict[str, Any]:
-    return db.portfolio_snapshot(settings.paper_initial_equity)
+    local = db.portfolio_snapshot(settings.paper_initial_equity)
+    if not settings.alpaca_paper_trading_enabled:
+        return {
+            **local, "mode": "local_simulation",
+            "execution_status": paper_broker.execution_status(),
+            "local_simulation_positions": local["open_positions"],
+            "broker_positions": [],
+        }
+
+    execution = paper_broker.execution_status()
+    if not execution.get("connected") or not isinstance(execution.get("account"), dict):
+        return {
+            **local, "mode": "alpaca_paper_disconnected",
+            "execution_status": execution,
+            "local_simulation_positions": local["open_positions"],
+            "open_positions": [],
+            "broker_positions": execution.get("broker_positions", []),
+        }
+
+    local_open = local["open_positions"]
+    broker_local = [row for row in local_open if row.get("execution_mode") == "alpaca_paper"]
+    local_only = [row for row in local_open if row.get("execution_mode") != "alpaca_paper"]
+    broker_by_symbol = {
+        str(row.get("symbol", "")).upper(): row
+        for row in execution.get("broker_positions", [])
+    }
+    tracked_broker_positions = []
+    for row in broker_local:
+        broker_row = broker_by_symbol.get(str(row.get("symbol", "")).upper(), {})
+        tracked_broker_positions.append({
+            **row,
+            "current_price": float(broker_row.get("current_price") or row["current_price"]),
+            "execution_mode": "alpaca_paper",
+        })
+    account = execution["account"]
+    broker_positions = execution.get("broker_positions", [])
+    gross_exposure = sum(
+        abs(float(row.get("market_value") or 0)) for row in broker_positions
+    )
+    unrealized_pnl = sum(float(row.get("unrealized_pl") or 0) for row in broker_positions)
+    return {
+        **local,
+        "mode": "alpaca_paper",
+        "equity": float(account.get("equity") or 0),
+        "cash_estimate": float(account.get("cash") or 0),
+        "gross_exposure": gross_exposure,
+        "unrealized_pnl": unrealized_pnl,
+        "realized_pnl": None,
+        "open_positions": tracked_broker_positions,
+        "local_simulation_positions": local_only,
+        "broker_positions": broker_positions,
+        "execution_status": execution,
+        "account_equity_source": "Alpaca Paper account API",
+        "local_simulation_pnl_is_separate": True,
+    }
 
 
 @app.get("/api/orders")
@@ -311,6 +371,12 @@ async def update_stops(position_id: str, request: UpdateStopsRequest) -> dict[st
         if row["status"] != "open":
             conn.rollback()
             raise HTTPException(status_code=409, detail="Position is already closed.")
+        if row["execution_mode"] == "alpaca_paper":
+            conn.rollback()
+            raise HTTPException(
+                status_code=409,
+                detail="This position is broker-managed. Change its bracket orders in Alpaca Paper; use Close at mark here to close it through Alpaca.",
+            )
         if row["side"] == "long":
             if request.stop_loss < row["stop_loss"]:
                 conn.rollback()
@@ -349,14 +415,12 @@ async def update_stops(position_id: str, request: UpdateStopsRequest) -> dict[st
 @app.post("/api/positions/{position_id}/close")
 async def close_position(position_id: str, request: ClosePositionRequest) -> dict[str, Any]:
     try:
-        # Never let the browser choose the price used to book simulated P&L.
-        # Close at the most recent server-recorded market mark instead.
-        result = db.close_position(position_id, None)
-        db.add_audit("paper_position.closed", result)
-        return result
+        # Local simulation closes at the last local mark; Alpaca-backed positions close
+        # through the hard-coded paper API and book only the confirmed broker fill.
+        return paper_broker.close_position(position_id)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
-    except ValueError as exc:
+    except (ValueError, RuntimeError) as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
