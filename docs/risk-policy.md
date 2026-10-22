@@ -27,6 +27,7 @@ This software is a research and simulation tool, not financial advice. New trade
 - Aggregate gross exposure cap: MAX_GROSS_EXPOSURE_PCT (default 20% of equity).
 - Maximum open paper positions: 5.
 - Daily loss guard: blocks new entries when current New York calendar day's realized and unrealized P&L reaches the configured threshold. UTC midnight is not the US trading-day boundary.
+- Every new approval is rejected outside NYSE regular trading hours and during the final ten minutes before the scheduled close, including local-only simulation approvals.
 - Stop loss and take profit are required for a proposal.
 - PAPER_INITIAL_EQUITY=100000 applies only to local simulation. In Alpaca Paper mode, account equity, cash, positions and broker marks come from the Alpaca account API.
 - These values are engineering defaults, not recommendations for real capital.
