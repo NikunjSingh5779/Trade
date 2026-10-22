@@ -29,7 +29,7 @@ PAPER_INITIAL_EQUITY applies only to local simulation. It does not change the Al
 - Paper-only config is mandatory. The app does not expose or build a live trading endpoint.
 - Missing/invalid market-data credentials block fresh scans. Missing/invalid paper trading credentials prevent Alpaca Paper requests.
 - A broker entry must pass freshness, deterministic risk checks, and broker reconciliation first. Failed/ambiguous broker requests should be reconciled by client/order ID before retrying.
-- Alpaca-backed exits and manual close actions must use the paper Trading API; they are not booked at an old SQLite mark. If broker execution cannot be confirmed, the position is left open locally and a diagnostic is shown.
+- Alpaca-backed exits and manual close actions must use the paper Trading API; they are not booked at an old SQLite mark. Entry and close intents are persisted before broker writes. If a write result is ambiguous, the app does not resubmit it blindly; it searches Alpaca orders/positions and blocks new entries until reconciled. Manual retry-release requires a 120-second wait, explicit operator confirmation, and fresh broker-side checks.
 - Malformed model output never creates a valid proposal. Hosted inference fallback remains disabled unless explicitly opted in.
 - Do not expose the local API publicly and never commit credentials.
 
