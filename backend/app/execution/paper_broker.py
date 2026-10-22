@@ -11,6 +11,8 @@ from app.risk.validator import RiskRejected, validate_and_size
 from app.storage import Database
 from app.market_data.sessions import is_regular_us_bar, is_regular_us_session
 
+NEW_YORK = ZoneInfo("America/New_York")
+
 
 class PaperBroker:
     """Local simulated broker. Intentionally contains no live-order methods."""
@@ -209,6 +211,8 @@ class PaperBroker:
                 raise RuntimeError("Autonomous paper trading is disabled.")
             if not is_regular_us_session():
                 raise RiskRejected("Automated entries are allowed only during regular US market hours.")
+        if self.settings.alpaca_paper_trading_enabled and not is_regular_us_session():
+            raise RiskRejected("Alpaca Paper entries are allowed only during regular US market hours.")
 
         proposal_record = self.db.get_proposal(proposal_id)
         if proposal_record is None:
@@ -246,6 +250,8 @@ class PaperBroker:
         # Recheck the current server-stored market mark at approval time. The requested entry
         # is not treated as an automatically achieved fill price.
         data_timeframe = proposal_record.get("data_timeframe")
+        if data_timeframe != "intraday" or proposal_record.get("timeframe") != "intraday":
+            raise RiskRejected("This build accepts intraday proposals only; regenerate on five-minute candles.")
         if automated and (
             data_timeframe != "intraday"
             or proposal_record.get("timeframe") != "intraday"
@@ -303,25 +309,51 @@ class PaperBroker:
         priced_proposal = {**proposal_record, "entry_price": fill_price}
 
         portfolio = self.db.portfolio_snapshot(self.settings.paper_initial_equity)
+        alpaca_mode = self.settings.alpaca_paper_trading_enabled
+        account: dict[str, Any] = {}
+        broker_positions: list[dict[str, Any]] = []
+        if alpaca_mode:
+            account, broker_positions = self._require_reconciled_broker()
+            try:
+                portfolio["equity"] = float(account["equity"])
+            except (KeyError, TypeError, ValueError) as exc:
+                raise RiskRejected("Alpaca Paper account did not return valid equity.") from exc
+            portfolio["gross_exposure"] = sum(
+                abs(float(item.get("market_value") or (
+                    float(item.get("qty", 0)) * float(item.get("current_price", 0))
+                )))
+                for item in broker_positions
+            )
+            portfolio["unrealized_pnl"] = sum(
+                float(item.get("unrealized_pl") or 0) for item in broker_positions
+            )
+
+        # Treat each trading day as a New York calendar day, even across UTC midnight.
+        local_now = datetime.now(NEW_YORK)
+        day_start_local = local_now.replace(hour=0, minute=0, second=0, microsecond=0)
+        day_end_local = day_start_local + timedelta(days=1)
+        day_start = day_start_local.astimezone(UTC).isoformat()
+        day_end = day_end_local.astimezone(UTC).isoformat()
+        execution_mode = "alpaca_paper" if alpaca_mode else "local_simulation"
         with self.db.connect() as conn:
-            day_start = datetime.now(UTC).date().isoformat()
             row = conn.execute(
                 "SELECT COALESCE(SUM(realized_pnl),0) FROM positions "
-                "WHERE status='closed' AND substr(closed_at,1,10)=?",
-                (day_start,),
+                "WHERE status='closed' AND execution_mode=? AND closed_at>=? AND closed_at<?",
+                (execution_mode, day_start, day_end),
             ).fetchone()
             daily_realized = float(row[0])
         daily_marked_pnl = daily_realized + float(portfolio["unrealized_pnl"])
-        max_daily_loss = portfolio["initial_equity"] * self.settings.daily_loss_limit_pct / 100
+        risk_equity = float(portfolio["equity"])
+        max_daily_loss = risk_equity * self.settings.daily_loss_limit_pct / 100
         if daily_marked_pnl <= -max_daily_loss:
             raise RiskRejected(
-                "Daily paper loss limit reached; new positions are blocked for the current UTC day."
+                "Daily paper loss limit reached; new positions are blocked for the current US trading day."
             )
 
         current_positions = portfolio["open_positions"]
         validated, quantity, estimated_risk = validate_and_size(
             priced_proposal,
-            portfolio["equity"],
+            risk_equity,
             len(current_positions),
             portfolio["gross_exposure"],
             risk_per_trade_pct=self.settings.risk_per_trade_pct,
@@ -330,17 +362,36 @@ class PaperBroker:
             max_gross_exposure_pct=self.settings.max_gross_exposure_pct,
             min_reward_risk=self.settings.min_reward_risk,
         )
+
+        broker_order: dict[str, Any] | None = None
+        broker_order_id: str | None = None
+        if alpaca_mode:
+            # The stable client ID prevents duplicate brokerage orders after a timeout/restart.
+            broker_order = self.alpaca.submit_bracket(
+                symbol=validated.symbol, side=validated.side, quantity=quantity,
+                stop_loss=validated.stop_loss, take_profit=validated.take_profit,
+                client_order_id=self._client_order_id(proposal_id),
+            )
+            broker_order_id = str(broker_order["id"])
+            fill_price = float(broker_order["filled_avg_price"])
+            estimated_risk = quantity * abs(fill_price - float(validated.stop_loss))
+            if fill_price <= 0:
+                raise AlpacaPaperError("Alpaca Paper reported a non-positive entry fill price.")
+
         result = self.db.approve_paper_trade(
             proposal_id, version, quantity, self.settings.max_open_positions,
-            portfolio["equity"] * self.settings.max_gross_exposure_pct / 100,
+            risk_equity * self.settings.max_gross_exposure_pct / 100,
             simulated_fill_price=fill_price,
-            slippage_bps=self.settings.simulated_slippage_bps,
+            slippage_bps=0 if alpaca_mode else self.settings.simulated_slippage_bps,
+            execution_mode=execution_mode,
+            broker_order_id=broker_order_id,
         )
         self.db.add_audit("paper_trade.approved", {
             "proposal_id": proposal_id, "version": version, "symbol": validated.symbol,
             "quantity": quantity, "estimated_risk": estimated_risk, "order_id": result["order_id"],
-            "market_mark": market_price, "simulated_fill_price": fill_price,
-            "slippage_bps": self.settings.simulated_slippage_bps,
+            "market_mark": market_price, "fill_price": fill_price,
+            "execution_mode": execution_mode, "broker_order_id": broker_order_id,
+            "slippage_bps": 0 if alpaca_mode else self.settings.simulated_slippage_bps,
             "fill_bar_timestamp": latest_bar["timestamp"],
         })
         return {**result, "estimated_risk": estimated_risk, "risk_budget": portfolio["equity"] *
