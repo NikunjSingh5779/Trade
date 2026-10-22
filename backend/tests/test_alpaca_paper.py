@@ -563,7 +563,7 @@ def test_close_intent_cannot_be_released_when_matching_order_exists(tmp_path, mo
         "submitted_at": (datetime.now(UTC) - timedelta(minutes=4)).isoformat(),
     }])
 
-    with pytest.raises(Exception, match="matching close order exists"):
+    with pytest.raises(Exception, match="matching close order"):
         broker.resolve_unknown_close_intent(
             position["id"], confirmed_no_close_order_and_position_open=True
         )
