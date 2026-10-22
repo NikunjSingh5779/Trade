@@ -647,8 +647,11 @@ class Database:
             ).fetchall()
             return [{**dict(r), "details": json.loads(r["details_json"])} for r in rows]
 
-    def close_position(self, position_id: str, exit_price: float | None = None) -> dict[str, Any]:
-        """Close a paper position; None means use the server-recorded mark, never a client price."""
+    def close_position(
+        self, position_id: str, exit_price: float | None = None, *,
+        pricing_method_override: str | None = None,
+    ) -> dict[str, Any]:
+        """Close a paper position; None uses the server mark, never a client-supplied price."""
         if exit_price is not None and (not isinstance(exit_price, (int, float)) or exit_price <= 0):
             raise ValueError("Exit price must be positive.")
         now = utc_now()
@@ -661,10 +664,10 @@ class Database:
             if row["status"] != "open":
                 conn.rollback()
                 raise ValueError("Position is already closed.")
-            pricing_method = "explicit_test_price"
+            pricing_method = pricing_method_override or "explicit_test_price"
             if exit_price is None:
                 exit_price = float(row["current_price"])
-                pricing_method = "last_recorded_server_mark"
+                pricing_method = pricing_method_override or "last_recorded_server_mark"
             sign = 1 if row["side"] == "long" else -1
             pnl = (float(exit_price) - row["entry_price"]) * row["quantity"] * sign
             bar_timeframe = "1Day" if row["timeframe"] == "swing" else "5Min"
