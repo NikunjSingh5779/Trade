@@ -62,6 +62,11 @@ class QueueWorker:
     async def _process(self, task: str, payload: dict[str, Any]) -> dict[str, Any]:
         if task == "analyze_proposal":
             timeframe = str(payload.get("timeframe", "intraday"))
+            if timeframe != "intraday":
+                raise ValueError(
+                    "This build accepts intraday proposal jobs only; discard this old queued job "
+                    "and submit a new five-minute analysis."
+                )
             bars = payload.get("bars", [])
             ensure_fresh_bars(bars, timeframe, self.max_stale_data_seconds)
             result = await self.agent.run(task, payload)
