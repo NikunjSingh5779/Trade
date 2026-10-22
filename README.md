@@ -1,80 +1,87 @@
-# Trade — Personal AI Trading Agent
+# Trade — Personal AI Intraday Trading Agent
 
-A local-first, single-agent trading research and paper-trading application. Phase 1 targets US equities on Windows, uses a five-minute market scan, discovers configured OpenAI-compatible local model endpoints, and requires explicit approval for every new simulated position.
+A local-first US-equities intraday research and paper-trading application for Windows. It analyzes completed five-minute candles, asks one configured local AI model for a Long/Short/No Trade decision, applies deterministic risk checks, and closes intraday broker-backed positions through Alpaca Paper at the end of the regular session.
 
-## Safety status
+## Execution modes — read this before trading
 
-- Paper trading only. No live order API or live execution adapter is implemented.
-- `LIVE_TRADING_ENABLED=false` and `ALLOW_LIVE_ORDER_ENDPOINTS=false` are hard defaults.
-- All LLM generation requests use one shared inference gate, backed by an in-process lock and a cross-process file lock.
-- Hosted inference is opt-in and requires an explicitly configured eligible endpoint.
-- Strategy experiments are never automatically promoted.
+The default mode is **local simulation**. It writes simulated fills to the app's SQLite database. Those trades will never appear in Alpaca.
+
+Optional **Alpaca Paper mode** sends orders to the hard-coded https://paper-api.alpaca.markets endpoint. It records confirmed Alpaca Paper fills in SQLite, requests bracket orders with a stop and target, and displays the Alpaca account's equity/cash instead of presenting local simulation figures as broker figures. Live order endpoints are not implemented or configurable.
+
+Existing local-simulation positions cannot be transferred to Alpaca. Review them, then close only the positions you intend to remove from the local ledger before enabling Alpaca Paper order routing. The app flags local/broker discrepancies and blocks new Alpaca entries until reconciliation succeeds.
+
+## Safety settings
+
+- PAPER_TRADING_ONLY=true
+- LIVE_TRADING_ENABLED=false
+- ALLOW_LIVE_ORDER_ENDPOINTS=false
+- ALPACA_PAPER_TRADING_ENABLED=false by default; opt in only after configuring paper keys and reviewing existing positions.
+- Automated new positions are intraday-only and only allowed during regular US market hours. Swing entry requests are rejected.
+- New automated entries must pass server-side freshness, price-consistency, size, stop/target, daily-loss, position-count and exposure checks.
+- Alpaca Paper orders use an idempotent client order ID and a bracket stop/target. Alpaca remains a simulator, not real-money execution or proof of profitability.
+- The current session gate excludes weekends and out-of-hours but does not yet use Alpaca's calendar for US exchange holidays/early closes. Keep the app running during the session; no exit monitor can run while it is offline.
+- Do not commit or paste API credentials. Store separate Alpaca Paper credentials in the ignored root .env only.
 
 ## Requirements
 
 - Windows 10/11
 - Python 3.12+
-- Node.js 20.9+ (for the Next.js dashboard)
-- Optional US market-data account and API credentials
-- Optional OpenAI-compatible local inference server (for example, llama.cpp or Ollama with an OpenAI-compatible endpoint)
+- Node.js 20.9+
+- Alpaca account with API access for US stock market data
+- Optional OpenAI-compatible local inference server, such as llama.cpp or Ollama
 
 ## Start on Windows
 
-Open PowerShell in the repository root.
-
-### 1. Backend
+Open PowerShell in the repository root. The launcher creates .env and a local API token if needed.
 
 ```powershell
-py -3.12 -m venv .venv
-.\.venv\Scripts\Activate.ps1
-python -m pip install --upgrade pip
-python -m pip install -e .\backend
-Copy-Item .env.example .env
-# Edit .env if you want local model endpoints or market data.
-python -m uvicorn app.main:app --app-dir backend --reload --host 127.0.0.1 --port 8000
+.\scripts\dev.ps1
 ```
 
-The API docs are at http://127.0.0.1:8000/docs. Without data credentials, the application still starts; market scans report that the provider is not configured.
+The API documentation is at http://127.0.0.1:8000/docs and the dashboard is at http://127.0.0.1:3000. Stop the app using Ctrl+C in the backend and frontend terminals.
 
-### 2. Dashboard
+## Configure market data
 
-In another PowerShell terminal:
+Set MARKET_DATA_API_KEY and MARKET_DATA_API_SECRET in the root .env. MARKET_DATA_FEED=iex is the default. A valid market-data feed/API key is required for scans. Never print or share key values.
+
+## Connect Alpaca Paper order execution
+
+1. In the Alpaca dashboard, open/select a **Paper Trading** account and generate its paper API key pair. Paper keys are different from live keys.
+2. Make sure you can read the account at the Paper API host and confirm that the paper account has the balance you expect. New Alpaca Paper accounts default to $100,000; create a new paper account if you need a clean default account.
+3. Review/close any legacy local-simulation positions in the dashboard first. In local mode their close action only closes the SQLite simulation; they are not Alpaca holdings.
+4. Put the paper credentials into .env:
+   - ALPACA_PAPER_TRADING_ENABLED=true
+   - ALPACA_PAPER_API_KEY= (paper key ID)
+   - ALPACA_PAPER_API_SECRET= (paper secret)
+   - Keep market-data credentials under MARKET_DATA_API_KEY and MARKET_DATA_API_SECRET.
+5. Restart .\scripts\dev.ps1. Verify that the dashboard reports **Alpaca Paper API connected** and **Broker reconciliation: Matched** before expecting orders in Alpaca. Do not enable broker routing if the dashboard reports discrepancies.
+
+See docs/alpaca-paper-trading.md for the broker workflow and troubleshooting.
+
+## What $100,000 and $250 mean
+
+- PAPER_INITIAL_EQUITY=100000 is starting equity **only for local simulation**.
+- Alpaca Paper equity is fetched from Alpaca's account API; changing the local setting does not fund or reset Alpaca.
+- RISK_PER_TRADE_PCT=0.25 means a $250 stop-loss risk budget on $100,000 equity (100000 × 0.0025). It is not the amount invested in the trade. Quantity is also limited by stop distance, the 10% per-position cap and the 20% gross-exposure cap.
+- The default 1% daily loss limit is $1,000 on $100,000 equity. These are simulation safeguards, not financial advice.
+
+## Tests
 
 ```powershell
-cd frontend
+if (-not (Test-Path ".\.venv\Scripts\python.exe")) { py -3.12 -m venv .venv }
+.\.venv\Scripts\python.exe -m pip install -e ".\backend[test]"
+.\.venv\Scripts\python.exe -m pytest backend/tests -q
+```
+
+Frontend checks:
+
+```powershell
+Set-Location .\frontend
 npm install
-Copy-Item .env.local.example .env.local
-npm run dev
+npm run lint
+npm run build
 ```
 
-Open http://127.0.0.1:3000.
+## Important limitations
 
-### 3. Tests
-
-From the repository root with the virtual environment active:
-
-```powershell
-python -m pip install -e .\backend[test]
-python -m pytest backend/tests -q
-```
-
-## Local model discovery
-
-The backend probes `LOCAL_MODEL_BASE_URLS` sequentially and checks each endpoint's `/models` response. A URL should normally include the OpenAI-compatible API prefix, for example `http://127.0.0.1:8080/v1`. It uses the configured model ID if present and reported by the server; otherwise it chooses the first reported model ID. It will not download, launch, kill, or replace a model server.
-
-Hosted fallback is disabled by default. Set a hosted URL/model/key and explicitly set `HOSTED_FALLBACK_ENABLED=true` and `HOSTED_FALLBACK_ELIGIBLE=true` only after verifying the provider's current free quota, terms, and model access. The application cannot independently guarantee that a third-party quota is free or available.
-
-## Market-data behavior
-
-The initial adapter uses Alpaca's US stock market-data endpoint and the configured feed (default `iex`). The free feed has coverage and entitlement limits. Provide API credentials before enabling scans. Data is fetched for the configured watchlist in one request where the provider supports it. Scans run on a five-minute interval and are restricted to regular US market hours; the first implementation uses weekday/time checks and does not have a full exchange-holiday calendar.
-
-## Safety and limitations
-
-- Model output is untrusted. A proposal must pass Pydantic validation and deterministic risk checks.
-- New paper positions require approval bound to a proposal ID and version. The backend revalidates and atomically rejects duplicate approvals.
-- Paper fills are simplified simulations at the proposed entry price. They are not evidence of real execution quality.
-- The initial version is a foundation, not a profitable-trading guarantee or production-certified financial system.
-- Do not expose the local API publicly. This initial local-only dashboard has no multi-user authentication.
-- Never put API keys in Git. Use the local `.env` file, which is ignored by Git.
-
-See [docs/architecture.md](docs/architecture.md), [docs/risk-policy.md](docs/risk-policy.md), and [docs/model-providers.md](docs/model-providers.md).
+Paper results do not establish profitability. Alpaca Paper simulates fills; this application does not guarantee the same fills, account state or market outcomes as live trading. The session checker still needs an authoritative holiday/early-close calendar, and broker disconnect/restart/reconciliation paths should be tested before relying on it unattended. Live trading is intentionally unsupported.
