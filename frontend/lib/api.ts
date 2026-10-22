@@ -73,6 +73,10 @@ export type ExecutionStatus = {
     proposal_id: string; symbol: string; status: string;
     created_at: string; proposal_status: string;
   }>;
+  unresolved_closes?: Array<{
+    position_id: string; symbol: string; status: string;
+    created_at: string; side: string; quantity: number;
+  }>;
 };
 export type Portfolio = {
   mode: string; initial_equity?: number; equity: number; cash_estimate: number;
