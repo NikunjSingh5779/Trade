@@ -461,6 +461,92 @@ class Database:
                     "requested_entry_price": float(body["entry_price"]),
                     "slippage_bps": float(slippage_bps)}
 
+    def record_recovered_alpaca_paper_trade(
+        self, proposal_id: str, version: int, quantity: int, fill_price: float,
+        broker_order_id: str,
+    ) -> dict[str, Any]:
+        """Reconcile a confirmed broker fill that occurred before its local commit.
+
+        This records an already-existing Alpaca Paper fill; it never submits an order.
+        """
+        if quantity < 1 or not isinstance(fill_price, (int, float)) or fill_price <= 0:
+            raise ValueError("Recovered Alpaca fill quantity and price must be positive.")
+        if not broker_order_id.strip():
+            raise ValueError("A broker order ID is required to recover a fill.")
+
+        now = utc_now()
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            proposal_row = conn.execute(
+                "SELECT * FROM proposals WHERE id=?", (proposal_id,)
+            ).fetchone()
+            if proposal_row is None:
+                conn.rollback()
+                raise KeyError("Proposal not found for recovered Alpaca fill.")
+            if proposal_row["version"] != version:
+                conn.rollback()
+                raise ValueError("Proposal version changed; recovered broker fill needs manual review.")
+            existing = conn.execute(
+                "SELECT * FROM positions WHERE proposal_id=?", (proposal_id,)
+            ).fetchone()
+            if existing is not None:
+                conn.commit()
+                return {"position_id": existing["id"], "status": existing["status"],
+                        "mode": "alpaca_paper", "already_recorded": True}
+            if proposal_row["status"] != "pending":
+                conn.rollback()
+                raise ValueError("Proposal is no longer pending; recovered fill needs manual review.")
+
+            body = json.loads(proposal_row["body_json"])
+            if body.get("timeframe", "intraday") != "intraday":
+                conn.rollback()
+                raise ValueError("Only intraday fills can be recovered automatically.")
+            conflict = conn.execute(
+                "SELECT id FROM positions WHERE symbol=? AND status='open'",
+                (str(body["symbol"]).upper(),),
+            ).fetchone()
+            if conflict is not None:
+                conn.rollback()
+                raise ValueError("An open local position conflicts with the recovered broker fill.")
+
+            order_id, position_id = new_id("ord"), new_id("pos")
+            details = {
+                "proposal_id": proposal_id,
+                "proposal_version": version,
+                "requested_entry_price": float(body["entry_price"]),
+                "fill_price": float(fill_price),
+                "execution_mode": "alpaca_paper",
+                "broker_order_id": broker_order_id,
+                "fill_source": "alpaca_paper_broker_confirmed_fill_recovered_after_ambiguous_response",
+                "recovered_after_ambiguous_response": True,
+                "note": "This records an existing Alpaca Paper fill; no new broker order was submitted.",
+            }
+            conn.execute(
+                "INSERT INTO orders(id,proposal_id,symbol,side,quantity,status,simulated_price,created_at,details_json) "
+                "VALUES (?,?,?,?,?,'filled',?,?,?)",
+                (order_id, proposal_id, body["symbol"], body["side"], quantity,
+                 float(fill_price), now, json.dumps(details)),
+            )
+            conn.execute(
+                "INSERT INTO positions(id,proposal_id,symbol,side,quantity,entry_price,current_price,"
+                "stop_loss,take_profit,status,opened_at,timeframe,execution_mode) "
+                "VALUES (?,?,?,?,?,?,?,?,?,'open',?,?,'alpaca_paper')",
+                (position_id, proposal_id, body["symbol"], body["side"], quantity,
+                 float(fill_price), float(fill_price), float(body["stop_loss"]),
+                 float(body["take_profit"]), now, "intraday"),
+            )
+            conn.execute(
+                "UPDATE proposals SET status='approved',updated_at=? WHERE id=?",
+                (now, proposal_id),
+            )
+            conn.commit()
+            return {
+                "order_id": order_id, "position_id": position_id, "status": "filled",
+                "mode": "alpaca_paper", "execution_mode": "alpaca_paper",
+                "quantity": quantity, "fill_price": float(fill_price),
+                "broker_order_id": broker_order_id, "recovered": True,
+            }
+
     def reject_proposal(self, proposal_id: str, version: int) -> dict[str, Any]:
         with self.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
